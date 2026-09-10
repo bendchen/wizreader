@@ -1,0 +1,8 @@
+[package]
+name = "wiz-cli"
+version = "0.1.0"
+edition = "2021"
+description = "WizReader 命令行工具（build-index / search / peek）"
+
+[dependencies]
+wizreader = { path = ".." }
