@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, nextTick } from 'vue'
 import { api, type Settings, type NoteItem } from './api'
+import { exportNotesTo, exportNotesAsZips, exportNoteAs } from './exporter'
 import FolderTree from './components/FolderTree.vue'
 import NoteList from './components/NoteList.vue'
 import Reader from './components/Reader.vue'
@@ -92,7 +93,7 @@ window.addEventListener('keydown', async (e) => {
     // 列表内切换（简易实现：由 NoteList 重新加载后按序切换）
     const items = document.querySelectorAll('.note-item')
     if (!items.length) return
-    const idx = [...items].findIndex((el) => el.classList.contains('active'))
+    const idx = Array.from(items).findIndex((el) => el.classList.contains('active'))
     const next = e.key === 'ArrowDown' ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0)
     ;(items[next] as HTMLElement)?.click()
   }
@@ -158,6 +159,44 @@ async function pickDataDir() {
   }
 }
 
+// 顶栏导出菜单（FR-08）：仅导出功能；设置入口独立在旁边的「设置」按钮
+const showExportMenu = ref(false)
+const exporting = ref(false)
+async function runExport(fn: () => Promise<boolean>) {
+  if (exporting.value) return
+  showExportMenu.value = false
+  exporting.value = true
+  try {
+    await fn()
+  } finally {
+    exporting.value = false
+  }
+}
+function exportSelFolder() {
+  runExport(() => exportNotesTo(folder.value))
+}
+// 批量导出为「每篇一个 zip」（FR-08.1 / FR-02 瘦身可选）
+function exportSelFolderZips() {
+  runExport(() => exportNotesAsZips(folder.value))
+}
+// 当前笔记信息优先用列表已知的 NoteItem，拿不到（如历史记录进入）再取详情
+async function currentNoteMeta() {
+  const g = currentGuid.value
+  if (!g) return null
+  if (currentNote.value?.guid === g) return currentNote.value
+  return api.getNoteDetail(g)
+}
+async function exportCurrentNote(kind: 'zip' | 'html') {
+  const meta = await currentNoteMeta()
+  if (!meta) return
+  runExport(() => exportNoteAs(kind, meta.guid, meta.title))
+}
+async function exportCurrentFolder() {
+  const meta = await currentNoteMeta()
+  if (!meta) return
+  runExport(() => exportNotesTo(meta.location))
+}
+
 function toggleSettings() {
   showSettings.value = !showSettings.value
   if (!showSettings.value) {
@@ -169,7 +208,7 @@ function toggleSettings() {
     })
   }
 }
-// 单篇导出入口在 Reader 内部（导出 zip / 自包含 HTML）
+// 导出入口统一在顶栏「导出」菜单（exporter.ts），设置页与 Reader 不再重复放置
 </script>
 
 <template>
@@ -190,7 +229,31 @@ function toggleSettings() {
         ><i :style="{ width: pickPct + '%' }"></i
       ></span>
       <button :disabled="picking" @click="pickDataDir">设置数据源</button>
-      <button title="字号/主题/索引报告/导出等" @click="toggleSettings">⚙</button>
+      <!-- 导出菜单（FR-08）：仅导出功能；设置按钮独立在右侧 -->
+      <div class="export-menu">
+        <button :disabled="exporting" @click="showExportMenu = !showExportMenu">
+          导出 {{ exporting ? '…' : '▾' }}
+        </button>
+        <template v-if="showExportMenu">
+          <div class="menu-backdrop" @click="showExportMenu = false"></div>
+          <div class="menu-pop">
+            <!-- 两种批量格式（FR-08）：通用文件= 目录树还原可双击浏览；每篇 zip= 继承为知原生格式 -->
+            <a @click="exportSelFolder">
+              {{ folder ? `导出目录「${folder}」（通用文件）…` : '导出全部笔记（通用文件）…' }}
+            </a>
+            <a @click="exportSelFolderZips">
+              {{ folder ? `导出目录「${folder}」（每篇 zip）…` : '导出全部笔记（每篇 zip）…' }}
+            </a>
+            <template v-if="currentGuid">
+              <div class="menu-sep"></div>
+              <a @click="exportCurrentNote('zip')">当前笔记：导出 zip…</a>
+              <a @click="exportCurrentNote('html')">当前笔记：导出 HTML…</a>
+              <a @click="exportCurrentFolder">当前笔记所在目录…</a>
+            </template>
+          </div>
+        </template>
+      </div>
+      <button @click="toggleSettings">设置</button>
     </div>
 
     <!-- 设置页 -->
@@ -241,3 +304,49 @@ export default defineComponent({
   components: { SettingsView },
 })
 </script>
+
+<style scoped>
+/* 顶栏导出菜单（原 ⚙ 位置） */
+.export-menu {
+  position: relative;
+}
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.menu-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 41;
+  min-width: 240px;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  display: flex;
+  flex-direction: column;
+}
+.menu-pop a {
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 380px;
+}
+.menu-pop a:hover {
+  background: var(--bg-2);
+}
+.menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+</style>

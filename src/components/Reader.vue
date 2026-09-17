@@ -41,32 +41,6 @@ async function openOriginal() {
   }
 }
 
-// 单篇导出（FR-08）：zip / 自包含 HTML
-async function exportZip() {
-  if (!detail.value) return
-  const { save } = await import('@tauri-apps/plugin-dialog')
-  const dest = await save({ defaultPath: `${detail.value.title}.zip` })
-  if (!dest) return
-  try {
-    await api.exportNoteZip(detail.value.guid, dest)
-    alert('导出完成（含物化代码块与附件）')
-  } catch (e) {
-    alert(String(e))
-  }
-}
-async function exportHtml() {
-  if (!detail.value) return
-  const { save } = await import('@tauri-apps/plugin-dialog')
-  const dest = await save({ defaultPath: `${detail.value.title}.html` })
-  if (!dest) return
-  try {
-    await api.exportNoteHtml(detail.value.guid, dest)
-    alert('导出完成（自包含 HTML）')
-  } catch (e) {
-    alert(String(e))
-  }
-}
-
 function jumpFolder() {
   // 通知父组件切换目录
   if (detail.value) {
@@ -95,9 +69,6 @@ function jumpFolder() {
           <span>修改 {{ detail.data_modified }}</span>
           <span>{{ formatSize(detail.package_size) }}</span>
           <a v-if="detail.url" @click="openOriginal">查看原文 ↗</a>
-          <span class="grow"></span>
-          <a @click="exportZip">导出 zip</a>
-          <a @click="exportHtml">导出 HTML</a>
         </div>
       </div>
       <!-- 附件区（FR-05.6） -->

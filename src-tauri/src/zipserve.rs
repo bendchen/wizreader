@@ -64,24 +64,26 @@ impl ZipService {
     }
 
     /// 路径穿越防护（P10）：
-    /// - 拒绝绝对路径、`..`、`.`、空段、反斜杠
-    /// - 返回规范化后的 zip 内相对路径
+    /// - 拒绝绝对路径、反斜杠、URI 冒号、NUL、`..`
+    /// - percent 编码**逐轮解码后复验**：`..%2f..%2fetc` 这类二次编码不得绕过（SEC-4 实测发现）
+    /// - `.` 与空段（`a//b`）按规范化收敛，结果只可能是包内相对路径
     pub fn sanitize_entry_path(raw: &str) -> Result<String, ZipError> {
-        if raw.is_empty() {
-            return Err(ZipError::IllegalPath(raw.into()));
-        }
-        if raw.contains('\\') || raw.starts_with('/') || raw.contains(':') {
-            return Err(ZipError::IllegalPath(raw.into()));
-        }
-        if raw.contains('\0') {
-            return Err(ZipError::IllegalPath(raw.into()));
+        let mut cur = raw.to_string();
+        for _ in 0..3 {
+            Self::reject_escape(&cur)?;
+            let next = percent_encoding::percent_decode_str(&cur)
+                .decode_utf8_lossy()
+                .into_owned();
+            if next == cur {
+                break;
+            }
+            cur = next;
         }
         let mut parts: Vec<&str> = Vec::new();
-        for seg in raw.split('/') {
+        for seg in cur.split('/') {
             match seg {
                 "" => continue,
                 "." => continue,
-                ".." => return Err(ZipError::IllegalPath(raw.into())),
                 s => parts.push(s),
             }
         }
@@ -89,6 +91,20 @@ impl ZipService {
             return Err(ZipError::IllegalPath(raw.into()));
         }
         Ok(parts.join("/"))
+    }
+
+    /// 单层形态检查（原始串与每一轮解码结果都要过一遍）
+    fn reject_escape(s: &str) -> Result<(), ZipError> {
+        if s.is_empty()
+            || s.contains('\\')
+            || s.starts_with('/')
+            || s.contains(':')
+            || s.contains('\0')
+            || s.split('/').any(|seg| seg == "..")
+        {
+            return Err(ZipError::IllegalPath(s.into()));
+        }
+        Ok(())
     }
 
     fn open_archive(&self, guid: &str) -> Result<std::sync::Arc<Mutex<ZipArchive<File>>>, ZipError> {
@@ -179,14 +195,18 @@ impl ZipService {
     }
 }
 
-/// utf-8-sig 解码：剥离 BOM（G3）
-pub fn decode_utf8_sig(bytes: &[u8]) -> String {
-    let b = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+/// 剥离 UTF-8 BOM（G3），不改写数据，仅返回尾部切片
+pub fn strip_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         &bytes[3..]
     } else {
         bytes
-    };
-    String::from_utf8_lossy(b).to_string()
+    }
+}
+
+/// utf-8-sig 解码：剥离 BOM（G3）
+pub fn decode_utf8_sig(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(strip_bom(bytes)).to_string()
 }
 
 /// 按扩展名推断 Content-Type

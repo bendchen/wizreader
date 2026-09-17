@@ -28,6 +28,9 @@ notes/
 attachments/
 index.db
 
+# 内部设计文档含用户路径与内网信息，仅本地保留
+docs/
+
 # Rust 构建产物与 Tauri 自动生成文件
 src-tauri/target
 src-tauri/gen/schemas

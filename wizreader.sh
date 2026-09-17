@@ -12,8 +12,11 @@ set -euo pipefail
 
 PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
 TAURI_DIR="$PROJ_DIR/src-tauri"
-APP_BUNDLE="$TAURI_DIR/target/release/bundle/macos/wizreader.app"
-APP_BIN="$TAURI_DIR/target/release/wizreader"
+# 应用产物位置：优先 Universal 包（tauri build --target universal-apple-darwin），
+# 回退宿主架构包（tauri build）
+APP_BUNDLE_UNIVERSAL="$TAURI_DIR/target/universal-apple-darwin/release/bundle/macos/wizreader.app"
+APP_BUNDLE_HOST="$TAURI_DIR/target/release/bundle/macos/wizreader.app"
+APP_BIN="$TAURI_DIR/target/universal-apple-darwin/release/wizreader"
 CLI_BIN="$TAURI_DIR/target/release/wiz-cli"
 # 默认数据源目录（留空则自动探测 ~/.wiznote/<账号>/data，也可手动指定）
 DEFAULT_DATA_DIR=""
@@ -59,6 +62,27 @@ EOF
 cmd="${1:-app}"
 shift || true
 
+# 取两个候选包里最新构建的那一个。
+# 不能固定优先 Universal：重建宿主包后若仍打开旧的 Universal 包，会看到过期界面。
+bundle_bin() { printf '%s/Contents/MacOS/wizreader' "$1"; }
+newest_bundle() {
+  local b ts newest="" newest_ts=0
+  for b in "$APP_BUNDLE_UNIVERSAL" "$APP_BUNDLE_HOST"; do
+    [ -x "$(bundle_bin "$b")" ] || continue
+    ts=$(stat -f %m "$(bundle_bin "$b")")
+    if [ "$ts" -gt "$newest_ts" ]; then newest_ts=$ts; newest="$b"; fi
+  done
+  [ -n "$newest" ] && printf '%s\n' "$newest"
+}
+
+# 源码内容指纹。不能用 mtime 判新旧：编辑器回写会把时间戳推过构建时刻（实测误报），
+# 而 tauri 构建内嵌的是按内容哈希的资源，所以指纹只取内容。
+STAMP_FILE="$TAURI_DIR/target/.wizreader-src-digest"
+src_digest() {
+  find "$PROJ_DIR/src" "$TAURI_DIR/src" "$PROJ_DIR/index.html" "$TAURI_DIR/tauri.conf.json" \
+    -type f ! -name .DS_Store -print 2>/dev/null | sort | xargs shasum -a 1 2>/dev/null | shasum -a 1 | cut -c1-12
+}
+
 case "$cmd" in
   dev)
     ensure_settings
@@ -66,18 +90,32 @@ case "$cmd" in
     ;;
   app)
     ensure_settings
-    if [ -d "$APP_BUNDLE" ]; then
+    APP_BUNDLE="$(newest_bundle || true)"
+    if [ -n "$APP_BUNDLE" ]; then
+      # 陈旧提醒：源码指纹与上次构建记录不一致（没指纹文件则不提示，避免 npm 直构建时报错噪声）
+      if [ -f "$STAMP_FILE" ]; then
+        recorded="$(cat "$STAMP_FILE")"
+        current="$(src_digest)"
+        if [ "$recorded" != "$current" ]; then
+          echo "[wizreader] 注意：源码已改动（$recorded → ${current}）但在用包仍是旧构建，界面可能缺少新功能。" >&2
+          echo "[wizreader] 重建后再启动: $0 build   （开发模式: $0 dev）" >&2
+        fi
+      fi
       open "$APP_BUNDLE" "$@"
     elif [ -x "$APP_BIN" ]; then
       exec "$APP_BIN" "$@"
     else
       echo "[wizreader] 尚未构建 release 应用，请先执行: $0 build" >&2
+      echo "[wizreader] 或构建 Universal 包: npm run tauri build -- --target universal-apple-darwin" >&2
       echo "[wizreader] 或改用开发模式: $0 dev" >&2
       exit 1
     fi
     ;;
   build)
     cd "$PROJ_DIR" && npm run tauri build "$@"
+    # 记录本次构建对应的源码指纹，供 app 启动时比对
+    mkdir -p "$(dirname "$STAMP_FILE")" && src_digest > "$STAMP_FILE"
+    echo "[wizreader] 已记录源码指纹 $(cat "$STAMP_FILE")"
     ;;
   cli)
     if [ ! -x "$CLI_BIN" ]; then

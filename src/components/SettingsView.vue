@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { api, formatSize, type Settings, type BuildReport } from '../api'
+import { api, formatSize, safeFileName, type Settings, type BuildReport, type VerifyReport, type VerifyCheck } from '../api'
 import type { AttachmentItem } from '../api'
 import AttachmentModal from './AttachmentModal.vue'
 
@@ -13,7 +13,10 @@ const report = ref<BuildReport | null>(null)
 const unlinked = ref<AttachmentItem[]>([])
 const showUnlinked = ref(false)
 const confirmRebuild = ref(false)
-const exporting = ref(false)
+const verifying = ref(false)
+const verifyProgress = ref('')
+const verifyReport = ref<VerifyReport | null>(null)
+const withBench = ref(true)
 
 onMounted(async () => {
   settings.value = await api.getSettings()
@@ -22,10 +25,13 @@ onMounted(async () => {
   }
 })
 
-// 索引进度事件
+// 索引 / 巡检进度事件
 const { listen } = await import('@tauri-apps/api/event')
 listen<{ done: number; total: number }>('index-progress', (e) => {
   progress.value = `索引进度: ${e.payload.done}/${e.payload.total} 篇`
+})
+listen<{ stage: string; done: number; total: number }>('verify-progress', (e) => {
+  verifyProgress.value = `${e.payload.stage}: ${e.payload.done}/${e.payload.total}`
 })
 
 async function chooseDataDir() {
@@ -67,22 +73,44 @@ async function toggleUnlinked() {
   }
 }
 
-async function exportFolder(location: string) {
-  const { open } = await import('@tauri-apps/plugin-dialog')
-  const dir = await open({ directory: true })
-  if (typeof dir !== 'string') return
-  exporting.value = true
+/** T4.1–T4.4：在应用内跑全库巡检（源数据仍为只读） */
+async function runVerify() {
+  verifying.value = true
+  verifyReport.value = null
+  verifyProgress.value = ''
   try {
-    const r = await api.exportFolder(location, dir)
-    alert(
-      `导出完成：${r.notes_exported} 篇 / ${r.attachments_exported} 个附件，耗时 ${r.elapsed_ms} ms` +
-        (r.skipped.length ? `\n跳过 ${r.skipped.length} 项` : '')
-    )
+    verifyReport.value = await api.runVerify(withBench.value, false)
   } catch (e) {
     alert(String(e))
   } finally {
-    exporting.value = false
+    verifying.value = false
+    verifyProgress.value = ''
   }
+}
+
+async function saveVerifyReport() {
+  if (!verifyReport.value) return
+  const { open } = await import('@tauri-apps/plugin-dialog')
+  const dir = await open({ directory: true })
+  if (typeof dir !== 'string') return
+  try {
+    const paths = await api.saveVerifyReport(`${dir}/${safeFileName('M4 验收报告')}.md`, verifyReport.value)
+    alert('报告已写入：\n' + paths.join('\n'))
+  } catch (e) {
+    alert(String(e))
+  }
+}
+
+const VERIFY_GROUPS: [string, keyof VerifyReport][] = [
+  ['T4.1 全库巡检（10 项）', 'inspection'],
+  ['T4.0 导出产物自检', 'export_check'],
+  ['T4.2 源数据零写入', 'zero_write'],
+  ['T4.3 安全项', 'security'],
+  ['T4.4 性能基准', 'bench'],
+]
+
+function groupOf(r: VerifyReport, k: keyof VerifyReport): VerifyCheck[] {
+  return (r[k] as VerifyCheck[]) ?? []
 }
 
 async function update(patch: Partial<Settings>) {
@@ -187,12 +215,73 @@ async function update(patch: Partial<Settings>) {
     <AttachmentModal v-if="previewAtt" :attachment="previewAtt" @close="previewAtt = null" />
 
     <div class="settings-row" style="margin-top: 20px">
-      <label>导出（逃生舱）</label>
-      <button :disabled="exporting" @click="exportFolder('')">导出全库…</button>
-      <span style="color: var(--text-2); font-size: 12px">
-        按目录还原文件树，含物化代码块与附件；单篇导出在阅读区右上角菜单
-      </span>
+      <label>验收巡检</label>
+      <button :disabled="verifying || !settings?.data_dir" @click="runVerify">
+        {{ verifying ? '巡检中…' : '运行全库巡检' }}
+      </button>
+      <label class="inline-check">
+        <input v-model="withBench" type="checkbox" /> 含性能基准
+      </label>
+      <button v-if="verifyReport" @click="saveVerifyReport">保存报告…</button>
+      <span class="progress-text">{{ verifyProgress }}</span>
     </div>
-    <div v-if="exporting" class="progress-text">导出中…（全库约需数分钟）</div>
+    <div v-if="verifyReport" class="report-box">
+      <div :class="verifyReport.ok ? 'verify-ok' : 'verify-bad'">
+        {{ verifyReport.ok ? '✅ 全部通过' : '⚠️ 存在未通过项' }}・{{ verifyReport.elapsed_ms }} ms・{{ verifyReport.data_dir }}
+      </div>
+      <div v-for="[title, key] in VERIFY_GROUPS" :key="key" class="verify-group">
+        <div class="verify-title">{{ title }}</div>
+        <div v-for="c in groupOf(verifyReport, key)" :key="c.id" class="verify-item">
+          <span class="verify-mark">{{ c.skipped ? '－' : c.passed ? '✅' : '❌' }}</span>
+          <span><b>[{{ c.id }}]</b> {{ c.name }}</span>
+          <div class="verify-actual">实测：{{ c.actual }}</div>
+          <div class="verify-actual">期望：{{ c.expected }}</div>
+          <div v-for="s in c.samples" :key="s" class="verify-sample">· {{ s }}</div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.verify-ok {
+  color: #2e7d32;
+  font-weight: 600;
+}
+.verify-bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+.verify-group {
+  margin-top: 10px;
+}
+.verify-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.verify-item {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  column-gap: 6px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.verify-mark {
+  grid-row: span 2;
+}
+.verify-actual,
+.verify-sample {
+  grid-column: 2;
+  color: var(--text-2);
+}
+.verify-sample {
+  color: var(--danger);
+}
+</style>

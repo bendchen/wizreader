@@ -6,15 +6,21 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config::{save_settings, Settings};
-use crate::export::{export_folder, export_note_single_html, export_note_zip, ExportContext, ExportReport};
+use crate::export::{
+    export_folder, export_folder_zips, export_note_single_html, export_note_zip, ExportAttachment,
+    ExportContext, ExportReport, FolderZipExportReport,
+};
 use crate::indexer::{build_index, BuildReport};
 use crate::search::{self, SearchResponse};
+use crate::verify;
 use crate::zipserve::ZipService;
 
 pub struct AppState {
     pub zip: ZipService,
     pub settings: std::sync::Mutex<Settings>,
 }
+
+regex_of!(re_rtf, r"\\'[0-9a-fA-F]{2}|\\[a-zA-Z]+-?\d* ?|[{\}]");
 
 impl AppState {
     pub fn index_db(&self) -> PathBuf {
@@ -446,8 +452,7 @@ pub fn preview_attachment(_state: State<AppState>, file_path: String) -> Result<
 
 /// RTF 降级为纯文本（FR-05.6）
 fn strip_rtf(rtf: &str) -> String {
-    let re_ctrl = regex::Regex::new(r"\\'[0-9a-fA-F]{2}|\\[a-zA-Z]+-?\d* ?|[{}]").unwrap();
-    let cleaned = re_ctrl.replace_all(rtf, "").to_string();
+    let cleaned = re_rtf().replace_all(rtf, "").to_string();
     crate::extract::decode_entities(&cleaned)
 }
 
@@ -544,24 +549,33 @@ pub fn get_unlinked(state: State<AppState>) -> Result<Vec<AttachmentItem>, Strin
 
 // ---------- 导出（FR-08） ----------
 
+fn to_export_attachments(detail: &NoteDetail) -> Vec<ExportAttachment> {
+    detail
+        .attachments
+        .iter()
+        .map(|a| ExportAttachment {
+            display_name: a.display_name.clone(),
+            src: a.file_path.clone(),
+            size: a.size,
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn export_note_zip_cmd(
-    app: AppHandle,
     state: State<AppState>,
     guid: String,
     dest: String,
-) -> Result<(), String> {
+) -> Result<ExportReport, String> {
     let detail = get_note_detail(state.clone(), guid.clone())?;
     let ctx = export_ctx(&state)?;
-    let items: Vec<(String, String, bool)> = detail
-        .attachments
-        .iter()
-        .map(|a| (a.display_name.clone(), a.file_path.clone(), a.exists))
-        .collect();
-    let title: String = detail.title.clone();
-    export_note_zip(&ctx, &state.zip, &guid, &title, &items, Path::new(&dest))?;
-    let _ = app;
-    Ok(())
+    export_note_zip(
+        &ctx,
+        &state.zip,
+        &guid,
+        &to_export_attachments(&detail),
+        Path::new(&dest),
+    )
 }
 
 #[tauri::command]
@@ -569,29 +583,60 @@ pub fn export_note_html_cmd(
     state: State<AppState>,
     guid: String,
     dest: String,
-) -> Result<(), String> {
+) -> Result<ExportReport, String> {
     let detail = get_note_detail(state.clone(), guid.clone())?;
     let ctx = export_ctx(&state)?;
-    let items: Vec<(String, String, bool)> = detail
-        .attachments
-        .iter()
-        .map(|a| (a.display_name.clone(), a.file_path.clone(), a.exists))
-        .collect();
-    let title: String = detail.title.clone();
-    export_note_single_html(&ctx, &state.zip, &guid, &title, &items, Path::new(&dest))
+    export_note_single_html(
+        &ctx,
+        &state.zip,
+        &guid,
+        &to_export_attachments(&detail),
+        Path::new(&dest),
+    )
 }
 
+/// 按目录 / 全库导出：耗时数分钟，放到 blocking 线程池，避免冻结界面
 #[tauri::command]
-pub fn export_folder_cmd(
+pub async fn export_folder_cmd(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     location: String,
     dest: String,
 ) -> Result<ExportReport, String> {
-    let ctx = export_ctx(&state)?;
-    let report = export_folder(&ctx, &state.zip, &location, Path::new(&dest), &|done, total| {
-        let _ = app.emit("export-progress", serde_json::json!({"done": done, "total": total}));
-    })?;
+    let data_dir = state.data_dir().ok_or("未设置数据源目录")?;
+    let index_db = index_db_of(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let zip = ZipService::new(data_dir.join("notes"));
+        let ctx = ExportContext::new(data_dir.join("notes"), index_db);
+        export_folder(&ctx, &zip, &location, Path::new(&dest), &|done, total| {
+            let _ = app.emit("export-progress", serde_json::json!({"done": done, "total": total}));
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(report)
+}
+
+/// 每份笔记导出为一个 zip（FR-08.1 批量形态）：slim=true 时执行 FR-02 存储瘦身。
+/// 耗时可能数分钟，放到 blocking 线程池，避免冻结界面
+#[tauri::command]
+pub async fn export_folder_zips_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    location: String,
+    dest: String,
+    slim: bool,
+) -> Result<FolderZipExportReport, String> {
+    let data_dir = state.data_dir().ok_or("未设置数据源目录")?;
+    let index_db = index_db_of(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let ctx = ExportContext::new(data_dir.join("notes"), index_db);
+        export_folder_zips(&ctx, &location, Path::new(&dest), slim, &|done, total| {
+            let _ = app.emit("export-progress", serde_json::json!({"done": done, "total": total}));
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     Ok(report)
 }
 
@@ -601,6 +646,44 @@ fn export_ctx(state: &State<AppState>) -> Result<ExportContext, String> {
         data_dir.join("notes"),
         state.index_db(),
     ))
+}
+
+// ---------- 验收巡检（M4：T4.1 – T4.4） ----------
+
+/// 全库巡检 + 安全项 + 性能基准，一次跑完并回报告
+#[tauri::command]
+pub async fn run_verify_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    with_bench: Option<bool>,
+    export_full: Option<bool>,
+) -> Result<verify::VerifyReport, String> {
+    let data_dir = state.data_dir().ok_or("未设置数据源目录")?;
+    let index_db = index_db_of(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        verify::run_all(
+            &data_dir,
+            &index_db,
+            with_bench.unwrap_or(true),
+            export_full.unwrap_or(false),
+            &|stage, done, total| {
+                let _ = app.emit(
+                    "verify-progress",
+                    serde_json::json!({"stage": stage, "done": done, "total": total}),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(report)
+}
+
+/// 落盘验收报告（Markdown + 同名 JSON），返回两个路径
+#[tauri::command]
+pub fn save_verify_report(dest: String, report: verify::VerifyReport) -> Result<Vec<String>, String> {
+    verify::write_report_files(Path::new(&dest), &report)
+        .map(|v| v.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
 }
 
 /// 自动探测为知默认数据目录：~/.wiznote/<账号>/data（macOS 隐藏目录，面板中难以导航）。

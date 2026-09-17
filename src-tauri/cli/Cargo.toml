@@ -6,3 +6,4 @@ description = "WizReader 命令行工具（build-index / search / peek）"
 
 [dependencies]
 wizreader = { path = ".." }
+rusqlite = { version = "0.32", features = ["bundled"] }

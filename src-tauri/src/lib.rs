@@ -6,12 +6,26 @@
 //! - 核心服务：zip 流式读取 / 检索 / 导出（Rust）
 //! - UI：Vue3 三栏布局，iframe 加载 wiznote:// 协议
 
+/// 定义一个「编译一次、进程内复用」的 Regex 访问器。
+/// 正则编译开销很大（Unicode 大小写折叠尤其），绝不能放在逐篇循环里。
+macro_rules! regex_of {
+    ($name:ident, $pat:expr) => {
+        fn $name() -> &'static ::regex::Regex {
+            static RE: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+            RE.get_or_init(|| ::regex::Regex::new($pat).expect("非法正则"))
+        }
+    };
+}
+
 pub mod commands;
 pub mod config;
 pub mod export;
 pub mod extract;
 pub mod indexer;
+pub mod manifest;
+pub mod sandbox;
 pub mod search;
+pub mod verify;
 pub mod zipserve;
 
 use std::sync::Mutex;
@@ -24,79 +38,6 @@ use tauri::Manager;
 use commands::AppState;
 use zipserve::{content_type, placeholder_svg, ZipError, ZipService};
 
-/// 宿主注入的兼容层 JS（T0.3/T2.3/T2.5，FR-05.4）
-/// - 形态 A：textarea → <pre><code>（逐容器判断，形态 B 跳过）
-/// - 每个代码块一键复制（S3 最高频动作）
-/// - R9：形态 B CodeMirror DOM 复制归一化
-/// - NFR-3.3：外链一律系统浏览器（经 wiznote-action 协议）
-const COMPAT_JS: &str = r#"(function(){
-  'use strict';
-  function copyText(text, btn){
-    function done(){ if(btn){ btn.textContent='已复制'; setTimeout(function(){btn.textContent='复制';},1200);} }
-    function fallback(){
-      var t=document.createElement('textarea');
-      t.value=text; t.style.cssText='position:fixed;opacity:0;';
-      document.body.appendChild(t); t.select();
-      try{ document.execCommand('copy'); done(); }catch(e){}
-      t.remove();
-    }
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done).catch(fallback);
-    } else { fallback(); }
-  }
-  function convert(){
-    document.querySelectorAll('.wiz-code-container').forEach(function(box){
-      if(box.dataset.wizProcessed) return;
-      box.dataset.wizProcessed='1';
-      var ta=box.querySelector('textarea');
-      if(!ta) return; /* 形态 B：已渲染，跳过 */
-      var pre=document.createElement('pre');
-      var code=document.createElement('code');
-      var lang=(box.dataset.mode||'').toLowerCase();
-      if(lang) code.className='language-'+lang;
-      code.textContent=ta.value; /* 浏览器已自动反转义实体 */
-      pre.appendChild(code);
-      pre.style.cssText='margin:0;overflow-x:auto;white-space:pre;';
-      ta.replaceWith(pre);
-      var btn=document.createElement('button');
-      btn.textContent='复制';
-      btn.style.cssText='position:absolute;top:4px;right:8px;font-size:12px;padding:2px 8px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;color:#333;z-index:9;';
-      btn.addEventListener('click',function(){ copyText(code.textContent, btn); });
-      box.style.position='relative';
-      box.appendChild(btn);
-    });
-  }
-  /* R9：形态 B 的 CodeMirror DOM（多层 span + 绝对定位）复制归一化 */
-  document.addEventListener('copy', function(e){
-    var sel=document.getSelection();
-    if(!sel || sel.isCollapsed || !sel.anchorNode) return;
-    var node = sel.anchorNode.nodeType===1 ? sel.anchorNode : sel.anchorNode.parentElement;
-    var cc = node && node.closest ? node.closest('.wiz-code-container') : null;
-    if(!cc || cc.querySelector('textarea')) return;
-    var lines=Array.prototype.slice.call(cc.querySelectorAll('.CodeMirror-line')).map(function(l){return l.textContent;});
-    if(lines.length){
-      e.clipboardData.setData('text/plain', lines.join('\n'));
-      e.preventDefault();
-    }
-  });
-  /* NFR-3.3：远程链接一律系统浏览器，绝不入 WebView */
-  document.addEventListener('click', function(e){
-    var a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if(!a) return;
-    var href=a.getAttribute('href')||'';
-    if(/^(https?:)?\/\//i.test(href)){
-      e.preventDefault();
-      var abs = href.indexOf('//')===0 ? 'https:'+href : href;
-      var img=new Image();
-      img.src='wiznote-action://open-url?url='+encodeURIComponent(abs);
-    }
-  });
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded', convert);
-  } else { convert(); }
-})();
-"#;
-
 /// 解析 wiznote:// URI → (guid, path)
 /// 兼容 macOS（wiznote://{guid}/{path}）与 Windows 归一化（http://wiznote.localhost/）变体
 fn parse_wiznote_uri(uri: &str) -> Option<(String, String)> {
@@ -108,25 +49,11 @@ fn parse_wiznote_uri(uri: &str) -> Option<(String, String)> {
     Some((guid.to_string(), path.to_string()))
 }
 
-fn note_csp(allow_remote: bool) -> String {
-    let img = if allow_remote {
-        "img-src wiznote: data: blob: http: https:"
-    } else {
-        "img-src wiznote: data: blob:"
-    };
-    format!(
-        "default-src 'none'; {}; style-src wiznote: data: 'unsafe-inline'; \
-         font-src wiznote: data:; script-src wiznote:; connect-src wiznote-action:; \
-         form-action 'none'; frame-src 'none'; object-src 'none'; media-src wiznote: data:;",
-        img
-    )
-}
-
-fn html_response(bytes: Vec<u8>, allow_remote: bool) -> tauri::http::Response<std::borrow::Cow<'static, [u8]>> {
+fn html_response(bytes: Vec<u8>, nonce: &str, allow_remote: bool) -> tauri::http::Response<std::borrow::Cow<'static, [u8]>> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CONTENT_SECURITY_POLICY, note_csp(allow_remote))
+        .header(header::CONTENT_SECURITY_POLICY, sandbox::note_csp(nonce, allow_remote))
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(std::borrow::Cow::Owned(bytes))
@@ -177,19 +104,20 @@ pub fn run() {
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/javascript; charset=utf-8")
-                    .body(std::borrow::Cow::Owned(COMPAT_JS.as_bytes().to_vec()))
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(std::borrow::Cow::Owned(sandbox::COMPAT_JS.as_bytes().to_vec()))
                     .unwrap();
             }
 
             let state = app.state::<AppState>();
             if guid != "_compat" && path == "index.html" {
-                // 主文档：物化注入 + CSP 沙箱
+                // 主文档：物化注入 + CSP 沙箱（每篇一个 nonce，见 sandbox.rs）
                 match state.zip.read_index_html(&guid) {
                     Ok(html) => {
-                        let snippet =
-                            r#"<script src="wiznote://_compat/compat.js"></script>"#;
-                        let injected = extract::inject_before_body_close(&html, snippet);
-                        return html_response(injected.into_bytes(), allow_remote);
+                        let n = sandbox::nonce();
+                        let injected =
+                            extract::inject_before_body_close(&html, &sandbox::compat_script_tag(&n));
+                        return html_response(injected.into_bytes(), &n, allow_remote);
                     }
                     Err(e) => return err_response(StatusCode::NOT_FOUND, &e.message()),
                 }
@@ -278,9 +206,31 @@ pub fn run() {
             commands::export_note_zip_cmd,
             commands::export_note_html_cmd,
             commands::export_folder_cmd,
+            commands::export_folder_zips_cmd,
+            commands::run_verify_cmd,
+            commands::save_verify_report,
             commands::pick_default_data_dir,
             commands::detect_wiznote_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_uri_shapes() {
+        assert_eq!(
+            parse_wiznote_uri("wiznote://{0002c9c7-e874-436f-be3d-941734660f15}/index.html"),
+            Some((
+                "{0002c9c7-e874-436f-be3d-941734660f15}".into(),
+                "index.html".into()
+            ))
+        );
+        // Windows 下 Tauri 会把自定义协议归一化为 http://wiznote.localhost/
+        assert!(parse_wiznote_uri("http://wiznote.localhost/{guid}/index_files/a.png").is_some());
+        assert!(parse_wiznote_uri("https://example.com/x").is_none());
+    }
 }

@@ -32,8 +32,9 @@ pub struct BuildReport {
     pub ok: bool,
 }
 
-fn guid_regex() -> regex::Regex {
-    regex::Regex::new(r"^\{([0-9a-fA-F-]{36})\}(.*)$").unwrap()
+fn guid_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^\{([0-9a-fA-F-]{36})\}(.*)$").unwrap())
 }
 
 /// 构建派生索引。`data_dir` 为源数据目录（含 index.db / notes/ / attachments/）。
@@ -255,7 +256,7 @@ pub fn build_index(
     dst.execute("BEGIN", []).map_err(|e| e.to_string())?;
     let total = docs.len();
     for (i, d) in docs.iter().enumerate() {
-        let package_size = std::fs::metadata(notes_dir.join(&d.guid))
+        let package_size = std::fs::metadata(notes_dir.join(package_name(&d.guid)))
             .map(|m| m.len() as i64)
             .unwrap_or(0);
         let (body_len, fp) = match zip.read_index_html(&d.guid) {
@@ -577,7 +578,18 @@ fn create_schema(dst: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn url_encode_path(p: &Path) -> String {
+/// notes/ 下的包文件名：磁盘上叫 `{guid}`，而 DOCUMENT_GUID 不带花括号。
+/// 早期直接 join(guid) 使 metadata 恒失败、package_size 静默写 0（M4 实跑发现）。
+fn package_name(guid: &str) -> String {
+    if guid.starts_with('{') {
+        guid.to_string()
+    } else {
+        format!("{{{guid}}}")
+    }
+}
+
+/// 路径 → SQLite URI 的安全片段（中文/空格/特殊字符需百分号编码）
+pub fn url_encode_path(p: &Path) -> String {
     p.to_string_lossy()
         .bytes()
         .map(|b| {
