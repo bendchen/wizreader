@@ -2,11 +2,61 @@
 import { invoke } from '@tauri-apps/api/core'
 
 export interface Settings {
-  data_dir: string | null
+  /** 主数据目录（笔记库根，可读可写） */
+  library_dir: string | null
+  /** 源数据目录（为知原始数据，只读，仅用于导入/导出） */
+  source_dir: string | null
   font_size: number
   theme: string
   read_width: number
   allow_remote: boolean
+}
+
+/**
+ * 视图上下文（与 Rust `commands::ViewContext` 对齐）：
+ * - `none`：未打开任何笔记（未设置数据目录，或数据目录的清单不可读）—— 不展示任何笔记
+ * - `library`：自有笔记库
+ * - `source`：为知笔记原始数据（只读）—— 只能由用户显式进入
+ */
+export type ViewContext = 'none' | 'library' | 'source'
+
+/** 库准入校验四态（与 Rust `library::LibraryStatus` 对齐） */
+export interface LibraryStatus {
+  /** empty / ready / no_manifest / rejected */
+  kind: string
+  reason: string
+  note_count: number
+  missing_files: number
+  warnings: string[]
+  dir: string
+}
+
+/** 库状态（启动自检 / 设置页；与 Rust `commands::LibraryStatusView` 对齐） */
+export interface LibraryStatusView {
+  library_dir: string | null
+  source_dir: string | null
+  context: ViewContext
+  /** 库清单（export.db）当前是否可读 —— 「是否打开笔记」的唯一判据 */
+  library_readable: boolean
+  /** 不可读的原因（library_readable=false 时非空），空态页如实展示 */
+  library_error: string
+  /**
+   * 库准入分类：unset / empty（空目录，待导入）/ no_manifest（有 zip 无清单）/
+   * rejected（不可用作库）/ ready
+   */
+  library_kind: string
+  manifest_notes: number
+  index_present: boolean
+  index_notes: number
+  consistent: boolean
+}
+
+/** 「导入到我的笔记库」结果（与 Rust `commands::ImportToLibraryReport` 对齐） */
+export interface ImportToLibraryReport {
+  export: FolderZipExportReport
+  attachments_copied: number
+  attachments_missing: number
+  index: BuildReport
 }
 
 export interface BuildReport {
@@ -67,6 +117,12 @@ export interface NoteDetail {
   data_modified: string
   package_size: number
   body_text_length: number
+  /**
+   * 正文形态（M4）：`'md'` = 包内 `note.md`；`'html'` = 为知原生 `index.html`；
+   * `null` = 该篇正文条目读不到（包缺失/损坏）—— 此时**不显示形态徽标**，
+   * 不要把 null 当成 `'html'`（那会把"读不到"谎报成一种形态）。
+   */
+  body_format: 'md' | 'html' | null
   attachments: AttachmentItem[]
 }
 
@@ -115,12 +171,9 @@ export interface ExportReport {
   elapsed_ms: number
 }
 
-/** 每份笔记导出为一个 zip 的结果（FR-08.1 批量形态 + FR-02 瘦身统计 + 同步清单计数，Rust 侧 serde flatten 展开） */
+/** 每份笔记导出为一个 zip 的结果（FR-08.1 批量形态 + 同步清单计数，Rust 侧 serde flatten 展开）。
+ *  **D0**：只产 native（源 zip 字节级拷贝），已无 slim 统计字段 */
 export interface FolderZipExportReport extends ExportReport {
-  slim: boolean
-  slim_files_removed: number
-  slim_bytes_removed: number
-  slim_report_path: string | null
   /** 同步清单 export.db 路径（云端同步数据分析.md §5） */
   manifest_path: string | null
   /** 清单四类计数：新增 / 重导 / 复用（零重写）/ 墓碑 */
@@ -154,6 +207,143 @@ export interface VerifyReport {
   elapsed_ms: number
 }
 
+// ---------- 云同步（FR-07 阶段二）----------
+
+/** 与 Rust `config::SyncSettings` 对齐；secret key 永不出现在此结构（存 keyring） */
+export interface SyncSettings {
+  enabled: boolean
+  /** "writer"（写入端）| "reader"（只读端）；旧值 "export" 由后端归一为 "writer" */
+  role: string
+  /**
+   * @deprecated U1 起同步根**恒为笔记库根**（settings.library_dir），本字段不再参与任何路径推导。
+   * 仅为与后端结构对齐而保留（后端迁移后会把它清空）；UI 不应再提供输入框。
+   */
+  local_root: string
+  endpoint: string
+  bucket: string
+  prefix: string
+  region: string
+  path_style: boolean
+  access_key_id: string
+  credential_user: string
+  concurrency: number
+  auto_check_on_start: boolean
+  initialized: boolean
+}
+
+export interface SyncConfigView {
+  config: SyncSettings
+  credential_set: boolean
+}
+
+export interface TestConnectionResult {
+  ok: boolean
+  latency_ms: number
+  can_read: boolean
+  can_write: boolean
+  objects_under_prefix: number
+  message: string
+}
+
+export interface SyncFailure {
+  key: string
+  reason: string
+  retryable: boolean
+}
+
+/** 与 Rust `sync::SyncReport` 对齐（serde 默认字段名） */
+export interface SyncReport {
+  /** "up" | "down" | "none" */
+  direction: string
+  uploaded: number
+  uploaded_bytes: number
+  downloaded: number
+  downloaded_bytes: number
+  skipped: number
+  /** U5：因远端版本更高而被留存到 `_conflicts/` 的篇数 */
+  conflicts: number
+  trashed: number
+  oversized: number
+  failures: SyncFailure[]
+  manifest_uploaded: boolean
+  remote_revision: number | null
+  local_revision: number
+  elapsed_ms: number
+}
+
+export interface GcReport {
+  removed: number
+  bytes: number
+  kept: number
+}
+
+export interface SyncStatusView {
+  enabled: boolean
+  role: string
+  initialized: boolean
+  last_sync_at: string | null
+  last_report: SyncReport | null
+  local_revision: number
+  trash_items: number
+  trash_bytes: number
+}
+
+export interface TrashItem {
+  guid: string
+  title: string
+  /** 删除前的库内相对路径 */
+  last_path: string
+  /** `_trash/` 下的实际相对路径（旧墓碑为 null） */
+  trash_rel: string | null
+  removed_at: string
+  size: number
+  /** 磁盘上是否找得到可恢复的文件 */
+  restorable: boolean
+  /** 不可恢复的原因（restorable=false 时非空） */
+  reason: string
+  days_left: number
+  /** 墓碑是否带恢复载荷（false = v3 及更早墓碑：只能恢复文件，不能还原清单行） */
+  has_snapshot: boolean
+}
+
+/** 回收站统计（与 Rust `commands::TrashStats` 对齐；根 = 库根） */
+export interface TrashStats {
+  root: string
+  items: number
+  bytes: number
+  retention_days: number
+}
+
+/** 一次库内写操作的结果（与 Rust `library::NoteWriteReport` 对齐，T5/T8） */
+export interface NoteWriteReport {
+  op: string
+  guid: string
+  title: string
+  exported_path: string
+  exported_size: number
+  exported_md5: string
+  data_modified: string
+  /** 行级 revision（写后；delete 为 0 —— 行已移入墓碑） */
+  revision: number
+  manifest_revision: number
+  /** 派生索引是否已同步更新（false = 需重建索引；**不是**写失败） */
+  index_updated: boolean
+  warnings: string[]
+}
+
+/**
+ * 正文源码（编辑抽屉初值；与 Rust `commands::NoteSource` 对齐，M3/§20.8）。
+ *
+ * `format` 是**库内包形态**，不是用户偏好：`md` = 包内正文是 `note.md`（Markdown 源），
+ * `html` = 为知原生包（`index.html`）。编辑器据此切换语法与保存口径 ——
+ * 保存时形态由包决定（后端按包内实况自动分派），前端不必也不能指定。
+ */
+export interface NoteSource {
+  format: 'md' | 'html'
+  /** 正文源文本（BOM 已剥） */
+  text: string
+}
+
 export const api = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (s: Settings) => invoke<void>('update_settings', { settings: s }),
@@ -182,9 +372,9 @@ export const api = {
     invoke<ExportReport>('export_note_html_cmd', { guid, dest }),
   exportFolder: (location: string, dest: string) =>
     invoke<ExportReport>('export_folder_cmd', { location, dest }),
-  /** 每份笔记导出为一个 zip；slim=true 时执行 FR-02 存储瘦身并出报告 */
-  exportFolderZips: (location: string, dest: string, slim: boolean) =>
-    invoke<FolderZipExportReport>('export_folder_zips_cmd', { location, dest, slim }),
+  /** 每份笔记导出为一个 zip（**D0**：恒 native 无损，无模式参数） */
+  exportFolderZips: (location: string, dest: string) =>
+    invoke<FolderZipExportReport>('export_folder_zips_cmd', { location, dest }),
   /** T4.1–T4.4 全库巡检；exportFull 会跑全库导出（产物约 2.5 GB，慎用） */
   runVerify: (withBench: boolean, exportFull: boolean) =>
     invoke<VerifyReport>('run_verify_cmd', { withBench, exportFull }),
@@ -193,6 +383,126 @@ export const api = {
     invoke<string[]>('save_verify_report', { dest, report }),
   pickDefaultDataDir: (dir: string) => invoke<void>('pick_default_data_dir', { dir }),
   detectWiznoteDir: () => invoke<string | null>('detect_wiznote_dir'),
+
+  // ---------- 笔记库（FR-11 P0/P1）----------
+  /** 选择主数据目录（笔记库）：红线校验 + 准入校验，返回 LibraryStatus 供分支 */
+  pickLibraryDir: (dir: string) => invoke<LibraryStatus>('pick_library_dir', { dir }),
+  /** 构建库派生索引（后台全量，进度走 index-progress 事件） */
+  buildLibraryIndex: () => invoke<BuildReport>('build_library_index_cmd'),
+  /** 导入源目录到我的笔记库（目标固定=库根；进度走 export-progress/index-progress） */
+  importToLibrary: (location: string) =>
+    invoke<ImportToLibraryReport>('import_to_library', { location }),
+  /** 库状态（库根、上下文、清单/索引篇数一致性） */
+  getLibraryStatus: () => invoke<LibraryStatusView>('get_library_status'),
+  /** 切换视图上下文：'library' | 'source' | 'none' */
+  setViewContext: (context: ViewContext) => invoke<ViewContext>('set_view_context', { context }),
+
+  // ---------- 笔记库编辑（FR-11 P2 / S2；M3 起形态自适应）----------
+  /** 新建笔记（origin=local）：生成 guid + md 包 + 清单插行（置脏）+ 单篇索引 */
+  createNote: (title: string, location: string, md: string) =>
+    invoke<NoteWriteReport>('create_note_cmd', { title, location, md }),
+  /**
+   * 读正文源码（编辑抽屉初值；不含宿主注入与 CSP，可直接写回）。
+   * 形态不写死在命令名里：md 包返回 `note.md` 的 Markdown、native 包返回 `index.html` 的 HTML。
+   */
+  getNoteSource: (guid: string) => invoke<NoteSource>('get_note_source', { guid }),
+  /** 该篇在磁盘上的绝对路径（在访达中显示用；库模式按清单解析，前端不拼路径） */
+  getNoteFilePath: (guid: string) => invoke<string>('get_note_file_path', { guid }),
+  /**
+   * 登记预览草稿：返回 token，预览用 `wiznote://{guid}/index.html?draft=<token>`。
+   * 这样预览与阅读走同一条协议（相对 index_files/ 能解析、CSP 与兼容层一致），
+   * 而草稿**只在带 token 的请求上生效**，不会污染普通阅读。
+   *
+   * `text` 的形态由**包内实况**决定（后端自行判定并渲染：md 草稿渲染成 HTML 再喂 iframe），
+   * 故这里只传文本、不传格式 —— 前端也就没有传错格式的可能。
+   */
+  setNoteDraft: (guid: string, text: string) =>
+    invoke<string>('set_note_draft', { guid, text }),
+  clearNoteDraft: () => invoke<void>('clear_note_draft'),
+  /**
+   * 保存正文：**按包内形态自动分派** —— md 包原子重写 `note.md`，native 包原子重写
+   * `index.html`；两者共用同一条路径（整包搬运 + 清单事务 + 单篇索引增量）。
+   */
+  saveNoteSource: (guid: string, text: string) =>
+    invoke<NoteWriteReport>('save_note_source_cmd', { guid, text }),
+  /** 重命名标题（落地文件名随标题变，云端键不变） */
+  renameNote: (guid: string, newTitle: string) =>
+    invoke<NoteWriteReport>('rename_note_cmd', { guid, newTitle }),
+  /** 移动到目录（newLocation 为知形态，如 `/工作/子目录/`） */
+  moveNote: (guid: string, newLocation: string) =>
+    invoke<NoteWriteReport>('move_note_cmd', { guid, newLocation }),
+  /** 删除 → 移入库根 `_trash/` + 写墓碑 */
+  deleteNote: (guid: string) => invoke<NoteWriteReport>('delete_note_cmd', { guid }),
+  /** 从回收站恢复（文件回原路径 + 清单行逐字段还原） */
+  restoreNote: (guid: string) => invoke<NoteWriteReport>('restore_trash', { guid }),
+  /** 回收站统计（库根 `_trash/` 实况） */
+  getTrashStats: () => invoke<TrashStats>('trash_stats'),
+
+  // ---------- 云同步（FR-07 阶段二）----------
+  getSyncConfig: () => invoke<SyncConfigView>('get_sync_config'),
+  /** 用待保存的值测试连接（不必先落盘）；secretKey 为空时使用钥匙串旧值 */
+  testCloudConnection: (config: SyncSettings, secretKey: string) =>
+    invoke<TestConnectionResult>('test_cloud_connection', { config, secretKey }),
+  /** 保存配置；secretKey 非空时写入 keyring（此后不再下发） */
+  saveSyncConfig: (config: SyncSettings, secretKey: string | null) =>
+    invoke<void>('save_sync_config', { config, secretKey }),
+  clearCloudCredentials: () => invoke<void>('clear_cloud_credentials'),
+  // U1：`pick_sync_root` 已删 —— 同步根恒为笔记库根，唯一可选的根是 `pickLibraryDir`。
+  /** 首次初始化（按角色分流，后台执行，进度走 sync-progress 事件）；role: "writer" | "reader" */
+  initCloudSync: (role: string) => invoke<SyncReport>('init_cloud_sync', { role }),
+  /** direction: "up" | "down" */
+  runSync: (direction: string) => invoke<SyncReport>('run_sync', { direction }),
+  getSyncStatus: () => invoke<SyncStatusView>('get_sync_status'),
+  listTrash: () => invoke<TrashItem[]>('list_trash'),
+  /** beforeDays > 0 时只清理早于该天数的目录；否则用默认保留期 30 天 */
+  purgeTrash: (beforeDays: number) => invoke<GcReport>('purge_trash', { beforeDays }),
+  openTrashDir: () => invoke<void>('open_trash_dir'),
+}
+
+/**
+ * 写操作错误码 → 人话（T8 硬要求：**保存失败必须显示具体错误码，不静默吞错**）。
+ *
+ * 后端一律以 `CODE: 说明` 的形态返回（见 `library.rs` / `commands.rs`），
+ * 这里保留原码并补一句"该怎么办"：只说"保存失败"等于让用户无从下手；
+ * 而把码藏起来，用户报问题时我们也没法定位。
+ */
+const WRITE_HINTS: Record<string, string> = {
+  LOCK_BUSY: '当前有同步或另一个写操作在进行，请稍后重试',
+  WRONG_CONTEXT: '该操作只能在「我的笔记库」视图下进行（为知笔记视图是只读的）',
+  READER_READONLY:
+    '本机角色是「只读端」（reader）：它以云端为准、不接受本地写入。请到写入端修改后再同步过来',
+  NO_CONTEXT: '尚未打开任何笔记库',
+  LIB_NO_MANIFEST: '数据目录里没有清单（export.db）',
+  NOTE_NOT_FOUND: '库内已无此篇（可能已被删除或在别处改动）',
+  NOTE_PACKAGE_MISSING: '清单里有该篇，但磁盘上找不到它的 zip',
+  NOTE_ALREADY_EXISTS: '清单里已有该篇，未覆盖',
+  PATH_TAKEN: '目标路径已被占用，请先移走或改名',
+  PATH_UNSAFE: '目标路径不安全（含绝对路径或 ..），已拒绝',
+  EMPTY_TITLE: '标题不能为空',
+  EMPTY_HTML: '正文为空，已拒绝保存（避免清空笔记）',
+  EMPTY_MD: '正文为空，已拒绝保存（避免清空笔记）',
+  HTML_HOST_REF: '正文含 wiznote:// 宿主引用，会污染导出与巡检，请删除后再保存',
+  MD_HOST_REF: '正文含 wiznote:// 宿主引用，会污染导出与巡检，请删除后再保存',
+  ENTRY_NOT_FOUND: '该篇 zip 内没有 index.html（本期只改已有正文，不新建）',
+  TOMBSTONE_NOT_FOUND: '回收站里没有这一篇（可能已经恢复过）',
+  NO_TOMBSTONE_PAYLOAD: '该墓碑来自旧版本，没有恢复载荷 —— 无法还原清单行',
+  TRASH_FILE_MISSING: '回收站里已找不到该篇的文件（可能已被超期清理）',
+  MANIFEST_BUSY: '清单正被占用，请稍后重试',
+}
+
+/** 从任意错误里抽出 `CODE:` 前缀；没有码时返回空串 */
+export function errorCode(e: unknown): string {
+  const m = /^\s*([A-Z][A-Z0-9_]{2,}):/.exec(String(e))
+  return m ? m[1] : ''
+}
+
+/** 写操作失败的展示文本：`具体错误码 + 原因 + 建议` */
+export function writeErrorText(e: unknown): string {
+  const raw = String(e)
+  const code = errorCode(e)
+  const hint = code ? WRITE_HINTS[code] : ''
+  const head = code ? `【${code}】` : ''
+  return `${head}${raw}${hint ? `\n\n建议：${hint}` : ''}`
 }
 
 export function formatSize(bytes: number): string {

@@ -1,9 +1,13 @@
 [package]
 name = "wiz-cli"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "WizReader 命令行工具（build-index / search / peek）"
 
 [dependencies]
 wizreader = { path = ".." }
 rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+md-5 = "0.10"
+# md-preview / md-export 要直接读某个 zip 文件的 index.html（库/源之外的第三条路）
+zip = { version = "2", default-features = false, features = ["deflate"] }

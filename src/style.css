@@ -130,6 +130,17 @@ body {
 .info-title { font-size: 16px; font-weight: 600; }
 .info-meta { font-size: 12px; color: var(--text-2); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
 .info-meta a { color: var(--accent); cursor: pointer; text-decoration: none; }
+/* 信息栏里的写操作入口（仅库上下文渲染；为知视图只读，不出现） */
+.rw-actions { display: inline-flex; gap: 6px; margin-left: auto; }
+.rw-btn {
+  padding: 3px 10px; font-size: 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.rw-btn:hover { background: var(--bg-3); }
+.rw-btn.primary { background: #1677ff; border-color: #1677ff; color: #fff; font-weight: 600; }
+.rw-btn.primary:hover { background: #0b5fd8; }
+.rw-btn.danger { color: var(--danger); border-color: rgba(192, 57, 43, 0.4); }
+.rw-btn.danger:hover { background: rgba(192, 57, 43, 0.1); }
 .attach-bar {
   padding: 6px 16px; border-bottom: 1px solid var(--border);
   background: var(--bg-2); display: flex; flex-wrap: wrap; gap: 6px; flex: none;

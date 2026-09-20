@@ -106,9 +106,28 @@ pub const COMPAT_JS: &str = r#"(function(){
       img.src='wiznote-action://open-url?url='+encodeURIComponent(abs);
     }
   });
+  /* md 包笔记（M3/§20.7）：正文由宿主把包内 note.md 渲染成 HTML 后提供，
+     没有 `.wiz-code-container`/隐藏 textarea 那套结构，故 convert() 覆盖不到它。
+     这里按 `body.md-body`（md_to_html_document 的固定标记）精确圈定，
+     给每个 <pre><code> 补上同样的"复制"按钮 —— 原生笔记没有 .md-body，不可能被这段影响。 */
+  function decorateMdCode(){
+    if(!document.body || !document.body.classList.contains('md-body')) return;
+    document.querySelectorAll('pre').forEach(function(pre){
+      if(pre.dataset.wizProcessed) return;
+      pre.dataset.wizProcessed='1';
+      var code=pre.querySelector('code');
+      if(!code) return;
+      var box=document.createElement('div');
+      box.style.position='relative';
+      pre.parentNode.insertBefore(box, pre);
+      box.appendChild(pre);
+      decorate(box, pre, code);
+    });
+  }
+  function boot(){ convert(); decorateMdCode(); }
   if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded', convert);
-  } else { convert(); }
+    document.addEventListener('DOMContentLoaded', boot);
+  } else { boot(); }
 })();
 "#;
 
@@ -176,8 +195,7 @@ mod tests {
 
     /// NFR-3.5：笔记内 JS 必须被禁，只有宿主注入的兼容层可运行
     #[test]
-    fn csp_disables_note_scripts_via_nonce() {
-        let csp = note_csp("abc123", false);
+    fn csp_disables_note_scripts_via_nonce() {        let csp = note_csp("abc123", false);
         let script = csp
             .split("; ")
             .find(|s| s.starts_with("script-src"))
@@ -212,5 +230,16 @@ mod tests {
     fn compat_js_skips_rendered_containers() {
         assert!(COMPAT_JS.contains("renderedLines(box)"));
         assert!(COMPAT_JS.contains("CodeMirror-measure"));
+    }
+
+    /// M3：md 包笔记的代码块也要有"复制"按钮 —— 兼容层必须按 `md-body` 精确圈定，
+    /// 且这条标记要与 `md::md_to_html_document` 的输出保持一致（那边有对应断言）。
+    #[test]
+    fn compat_js_decorates_md_rendered_code_only() {
+        assert!(COMPAT_JS.contains("md-body"), "必须按 md-body 圈定，否则改不动 md 笔记");
+        assert!(COMPAT_JS.contains("decorateMdCode"));
+        assert!(COMPAT_JS.contains("dataset.wizProcessed"), "必须去重，避免重复加按钮");
+        // 原生笔记（无 .md-body）不得走到这条分支：判定必须是"是 md-body 才处理"
+        assert!(COMPAT_JS.contains("classList.contains('md-body')) return;"));
     }
 }

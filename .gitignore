@@ -34,3 +34,8 @@ docs/
 # Rust 构建产物与 Tauri 自动生成文件
 src-tauri/target
 src-tauri/gen/schemas
+
+# GUI 验收工具的本地编译产物（源码 .c 与 README 保留）
+tools/gui/wizact
+tools/gui/winlist
+tools/gui/tis

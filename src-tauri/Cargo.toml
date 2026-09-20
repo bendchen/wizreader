@@ -1,6 +1,6 @@
 [package]
 name = "wizreader"
-version = "0.1.0"
+version = "1.0.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,35 @@ sha2 = "0.10"
 md-5 = "0.10"
 regex = "1"
 percent-encoding = "2"
+# 本地时间（`data_modified` 写入形态：源库口径是本地时间无后缀，见 manifest::now_local_str）。
+# 0.4 已在依赖树内（tauri 传递引入），此处只是把它变成直接依赖，不新增编译单元。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# ---- Markdown 库内格式（§20：库内主数据由为知原生 zip 改为 md 包）----
+# HTML→Markdown：用 html5ever 的 Tokenizer 走 token 流（不引 rcdom / scraper）。
+# 0.38 已在依赖树内（tauri 的 dom_query 传递引入）且本地 registry 缓存有 .crate，此处只是把它变成直接依赖。
+html5ever = "0.38"
+# Markdown→HTML：阅读与编辑预览共用同一个 Rust 侧渲染器（§20.7），只需 html feature（不要 getopts）
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+# ---- 云同步（FR-07，阶段二）----
+# S3 客户端：只用 HEAD/GET/PUT/LIST/DELETE 五个操作，flat 键空间不需要强类型 SDK（设计稿 D1）
+rust-s3 = { version = "0.37", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
+# 凭据入系统钥匙串（FR-07.2 / NFR-3），绝不明文落盘（设计稿 D2/D3）
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# 上行并发（D6 buffer_unordered）
+futures = "0.3"
+# 流式 PUT 的 async Read（tokio::fs::File）；tauri 自带 runtime，这里只取 io 能力
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "macros"] }
+# Content-MD5 头的 base64 编码
+base64 = "0.22"
+# 库内新建笔记的 guid（v5 预留 origin=local 的落地）；1.x 已在依赖树内（tauri 传递引入），
+# v4 特性只启用 getrandom（同样已在树内），离线可构建
+uuid = { version = "1", features = ["v4"] }
+# trait 上的 async 方法（dyn 兼容，测试可用 MemStore 替身）
+async-trait = "0.1"
+# with_header 需要的 HeaderName/HeaderValue 类型（与 reqwest 0.12 同版本族）
+http = "1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

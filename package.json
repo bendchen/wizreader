@@ -1,12 +1,13 @@
 {
   "name": "wizreader",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "test:logic": "node --test tests/*.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -3,7 +3,9 @@
 # 用法:
 #   ./wizreader.sh dev     开发模式（热重载，Vite + tauri dev）
 #   ./wizreader.sh app     启动已构建的 release 应用
-#   ./wizreader.sh build   构建 release 应用（.app）
+#   ./wizreader.sh build   构建 release 应用（默认只打 .app，跳过 DMG）
+#                          构建前会删除所有旧包：失败就没有包，绝不回退旧版本
+#   ./wizreader.sh build dmg  单独编译 DMG 发行镜像（需「终端控制 Finder」自动化权限）
 #   ./wizreader.sh cli ... 直接触发 wiz-cli（build-index / search / peek）
 # 不带参数时等价于 app。
 # 注：wiz-cli 为独立 workspace 成员（src-tauri/cli/），不参与 tauri 打包
@@ -112,7 +114,29 @@ case "$cmd" in
     fi
     ;;
   build)
-    cd "$PROJ_DIR" && npm run tauri build "$@"
+    # ./wizreader.sh build       默认只打 .app（日常开发足够）
+    # ./wizreader.sh build dmg   单独编译 DMG 发行镜像（--bundles dmg）
+    # 说明：DMG 步骤（bundle_dmg.sh）需要「终端控制 Finder」自动化权限，
+    # 被拒绝后 TCC 会记住并导致 DMG 打包必失败——
+    # 需先在 系统设置 → 隐私与安全性 → 自动化 允许终端控制 Finder
+    # （若列表无该条目：tccutil reset AppleEvents 重置后重跑，弹窗点「好」）。
+    if [ "${1:-}" = "dmg" ]; then
+      shift
+      set -- --bundles dmg "$@"
+    elif [ "$#" -eq 0 ]; then
+      set -- --bundles app
+    fi
+    # 构建前清理所有旧包（宿主 .app / Universal 旧包 / 旧 DMG / 失败残留 rw.*.dmg）：
+    # 保证「编译成功才有程序，失败就没有程序」，避免 app 启动时静默回退到过期旧包。
+    # （Universal 包如需保留请自行注释下行；需要时用
+    #   npm run tauri build -- --target universal-apple-darwin 重新构建）
+    echo "[wizreader] 清理旧构建包..."
+    rm -rf "$APP_BUNDLE_HOST" "$APP_BUNDLE_UNIVERSAL" \
+           "$TAURI_DIR/target/release/bundle/dmg" \
+           "$TAURI_DIR/target/universal-apple-darwin/release/bundle"
+    find "$TAURI_DIR/target/release/bundle/macos" -name 'rw.*.dmg' -delete 2>/dev/null || true
+    # npm run 转发参数必须带 -- 分隔符，否则 --bundles 会被 npm 自己吃掉
+    cd "$PROJ_DIR" && npm run tauri build -- "$@"
     # 记录本次构建对应的源码指纹，供 app 启动时比对
     mkdir -p "$(dirname "$STAMP_FILE")" && src_digest > "$STAMP_FILE"
     echo "[wizreader] 已记录源码指纹 $(cat "$STAMP_FILE")"
@@ -125,7 +149,8 @@ case "$cmd" in
     exec "$CLI_BIN" "$@"
     ;;
   *)
-    echo "用法: $0 {dev|app|build|cli <args>}"
+    echo "用法: $0 {dev|app|build [dmg]|cli <args>}"
+    echo "  build      默认只打 .app；build dmg 单独编译 DMG 发行镜像"
     exit 1
     ;;
 esac

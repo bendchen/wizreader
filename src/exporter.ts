@@ -6,7 +6,6 @@
 import {
   api,
   folderExportSummary,
-  formatSize,
   safeFileName,
   type FolderZipExportReport,
   type ExportReport,
@@ -42,13 +41,12 @@ export async function exportNotesTo(location: string, title?: string): Promise<b
 }
 
 /**
- * 批量导出「每份笔记一个 zip」（FR-08.1 批量形态）：
- * 选目标目录后二次确认是否 FR-02 存储瘦身（默认关闭，确定= 瘦身，取消= 继承为知原生 zip 格式）。
+ * 批量导出「每份笔记一个 zip」（FR-08.1 批量形态）。
+ * **D0**：只产 native —— 源 zip 的字节级原样拷贝（无损、不做任何删减），
+ * 因此不再询问「是否瘦身」（原 FR-02 slim 模式已整体取消；论证见 docs/本地笔记读写实现.md §4.6）。
  */
 export async function exportNotesAsZips(location: string, title?: string): Promise<boolean> {
-  // 同时引入插件的 confirm：绝不能用全局 window.confirm——dialog 插件注入的 shim
-  // 调用不存在的 plugin:dialog|confirm 命令（2.7.3 只注册 open/save/message），必然 reject
-  const { open, confirm } = await import('@tauri-apps/plugin-dialog')
+  const { open } = await import('@tauri-apps/plugin-dialog')
   const dir = await open({
     directory: true,
     title:
@@ -56,15 +54,7 @@ export async function exportNotesAsZips(location: string, title?: string): Promi
   })
   if (typeof dir !== 'string') return false
   try {
-    // FR-02：瘦身默认关闭，需用户显式触发并二次确认（确定/Ok = 瘦身，取消/Cancel = 原生）
-    const slim = await confirm(
-      '是否进行存储瘦身（FR-02）？\n\n' +
-        '瘦身仅保留 index.html 与被引用的资源，体积约可降 45%（实测解压口径 2.4 GB → 1.3 GB），\n' +
-        '并在导出目录生成「瘦身报告.csv」供抽查；全程不修改原始数据。\n\n' +
-        '「确定」= 瘦身导出；「取消」= 原样导出（继承为知原生 zip 格式，速度更快）',
-      { title: '导出格式选择', kind: 'info' }
-    )
-    alert(zipExportSummary(await api.exportFolderZips(location, dir, slim)))
+    alert(zipExportSummary(await api.exportFolderZips(location, dir)))
     return true
   } catch (e) {
     alert(String(e))
@@ -72,19 +62,15 @@ export async function exportNotesAsZips(location: string, title?: string): Promi
   }
 }
 
-/** 每份笔记一个 zip 的结果摘要（原生格式 / 瘦身两种模式共用） */
+/** 每份笔记一个 zip 的结果摘要（D0：只有 native 一种产物） */
 function zipExportSummary(r: FolderZipExportReport): string {
   return (
-    `导出完成：${r.notes_exported} 篇笔记各为一个 zip（${r.slim ? '已瘦身' : '原生格式'}），` +
+    `导出完成：${r.notes_exported} 篇笔记各为一个 zip（native：源 zip 逐字节拷贝，无损），` +
     `还原 ${r.folders_exported} 个目录，耗时 ${r.elapsed_ms} ms` +
     // 同步清单计数（云端同步数据分析.md §5/§11 阶段一）
     `\n清单 export.db：新增 ${r.notes_added} / 重导 ${r.notes_reexported} / 复用 ${r.notes_reused}` +
     (r.notes_removed ? ` / 墓碑 ${r.notes_removed}` : '') +
     (r.manifest_path ? `（${r.manifest_path}）` : '') +
-    (r.slim
-      ? `\n瘦身：删除冗余资源 ${r.slim_files_removed} 个 / ${formatSize(r.slim_bytes_removed)}` +
-        (r.slim_report_path ? `\n瘦身报告：${r.slim_report_path}` : '')
-      : '') +
     (r.manifest_warnings.length
       ? `\n⚠ 清单自检警告 ${r.manifest_warnings.length} 条：` +
         r.manifest_warnings.slice(0, 3).join('；') +

@@ -8,11 +8,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 
 use crate::extract::{extract_text, fingerprint};
-use crate::zipserve::ZipService;
+use crate::library::LibraryResolver;
+use crate::zipserve::{NotePathResolver, ZipService};
 
 pub const EXPECTED_NOTE_COUNT: usize = 1780;
 pub const EXPECTED_TIERS: (usize, usize, usize, usize, usize) = (79, 43, 5, 6, 2);
@@ -600,4 +602,599 @@ pub fn url_encode_path(p: &Path) -> String {
             }
         })
         .collect()
+}
+
+/// 读取旧派生索引里需保留的用户数据（检索历史 / 折叠状态），随后旧库可安全删除
+fn read_saved_user_data(index_db: &Path) -> (Vec<(String, i64)>, Vec<(String, bool)>) {
+    let mut history: Vec<(String, i64)> = Vec::new();
+    let mut states: Vec<(String, bool)> = Vec::new();
+    if index_db.exists() {
+        if let Ok(old) = Connection::open_with_flags(
+            index_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            if let Ok(mut st) = old.prepare("SELECT keyword, ts FROM search_history") {
+                if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                    history.extend(rows.flatten());
+                }
+            }
+            if let Ok(mut st) = old.prepare("SELECT path, expanded FROM folder_state") {
+                if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))) {
+                    states.extend(rows.flatten());
+                }
+            }
+        }
+    }
+    (history, states)
+}
+
+/// 库模式派生索引（FR-11 §4.1 / 计划第四节）：只读 `export.db` + resolver 定位 zip 正文，
+/// 产出与 [`build_index`] **表结构完全一致**的 index.db。与源模式的差异：
+/// - note 元数据直取清单（不读源 WIZ_DOCUMENT）；`package_size` 用 `exported_size`；
+/// - 正文经 `resolver`（清单 `exported_path`）定位 zip，**绝不拼路径**（§13.1）；
+/// - folder 由 location 去重推导，无 FOLDERS_POS（`pos=i64::MAX`，前端按名称序）；
+/// - attachment/attachment_doc 从清单直转，`file_path` 一律落**绝对路径**
+///   （`library_dir.join(相对路径)`，与源模式消费口径 `Path::new(fp).is_file()` 一致）；
+///   `db-missing:` 行原样保留（无实体文件）；tier/source 原样带过；
+/// - 校验口径：清单行数 == 磁盘 zip 命中数 == 索引 note 行数 → ok；**不做**
+///   EXPECTED_NOTE_COUNT/TIERS 基线断言（那是源库专属）。
+pub fn build_library_index(
+    library_dir: &Path,
+    resolver: Arc<LibraryResolver>,
+    index_db_path: &Path,
+    progress: &dyn Fn(usize, usize),
+) -> Result<BuildReport, String> {
+    let t0 = std::time::Instant::now();
+    let mut warnings = Vec::new();
+
+    // ---- 只读打开库清单（G1：绝不写库、绝不触发 migrate）----
+    let manifest_db = crate::manifest::manifest_path(library_dir);
+    if !manifest_db.is_file() {
+        return Err(format!("库清单缺失: {}", manifest_db.display()));
+    }
+    let m_uri = format!("file:{}?mode=ro", url_encode_path(&manifest_db));
+    let man = Connection::open_with_flags(
+        &m_uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| format!("打开库清单失败(mode=ro): {e}"))?;
+
+    // ---- 保留用户数据 + 删除旧索引重建 ----
+    if let Some(parent) = index_db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let (saved_history, saved_states) = read_saved_user_data(index_db_path);
+    if index_db_path.exists() {
+        std::fs::remove_file(index_db_path).map_err(|e| e.to_string())?;
+    }
+
+    // ---- 读清单 note 行 ----
+    struct MNote {
+        guid: String,
+        title: String,
+        location: String,
+        url: String,
+        doc_type: String,
+        created: String,
+        data_modified: String,
+        has_attachment: bool,
+        exported_size: i64,
+    }
+    let mut st = man
+        .prepare(
+            "SELECT guid, title, location, ifnull(url,''), ifnull(doc_type,''),
+                    created, data_modified, has_attachment, exported_size
+             FROM note ORDER BY guid",
+        )
+        .map_err(|e| e.to_string())?;
+    let notes: Vec<MNote> = st
+        .query_map([], |r| {
+            Ok(MNote {
+                guid: r.get(0)?,
+                title: r.get(1)?,
+                location: r.get(2)?,
+                url: r.get(3)?,
+                doc_type: r.get(4)?,
+                created: r.get(5)?,
+                data_modified: r.get(6)?,
+                has_attachment: r.get::<_, i64>(7)? != 0,
+                exported_size: r.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let manifest_count = notes.len();
+
+    // ---- 打开派生库（结构复用 create_schema）----
+    let mut dst = Connection::open(index_db_path).map_err(|e| e.to_string())?;
+    let _ = dst.pragma_update(None, "synchronous", "OFF");
+    let _ = dst.pragma_update(None, "journal_mode", "MEMORY");
+    let _ = dst.pragma_update(None, "cache_size", -64000i64);
+    create_schema(&dst)?;
+
+    // ---- 目录树（location 去重推导，无 FOLDERS_POS）----
+    let mut locations: HashSet<String> = HashSet::new();
+    for n in &notes {
+        locations.insert(n.location.clone());
+    }
+    for loc in &locations {
+        ensure_folders(&dst, loc)?;
+    }
+
+    // ---- 逐篇 note + fts（正文经 resolver 定位 zip）----
+    let zip = ZipService::with_resolver(resolver.clone() as Arc<dyn NotePathResolver>);
+    let mut disk_hits = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    dst.execute("BEGIN", []).map_err(|e| e.to_string())?;
+    let total = notes.len();
+    for (i, n) in notes.iter().enumerate() {
+        if resolver
+            .resolve(&n.guid)
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+        {
+            disk_hits += 1;
+        }
+        let (body_len, fp, body_text) = match note_body_text(&zip, &n.guid) {
+            Ok(v) => v,
+            Err(msg) => {
+                failed.push(format!("{}: {}", n.guid, msg));
+                (0, String::new(), String::new())
+            }
+        };
+        put_note_row(
+            &dst,
+            &IndexNoteRow {
+                guid: &n.guid,
+                title: &n.title,
+                location: &n.location,
+                url: &n.url,
+                doc_type: &n.doc_type,
+                created: &n.created,
+                data_modified: &n.data_modified,
+                has_attachment: n.has_attachment,
+                package_size: n.exported_size,
+                body_len,
+                fingerprint: &fp,
+                body_text: &body_text,
+            },
+        )?;
+        if (i + 1) % 10 == 0 || i + 1 == total {
+            progress(i + 1, total);
+        }
+    }
+    dst.execute("COMMIT", []).map_err(|e| e.to_string())?;
+    if !failed.is_empty() {
+        warnings.push(format!("{} 篇正文解析失败: {}", failed.len(), failed.join("; ")));
+    }
+
+    // ---- 附件：清单 attachment/attachment_doc 直转（file_path 落绝对路径）----
+    let mut tier1 = 0usize;
+    let mut tier2 = 0usize;
+    let mut tier3 = 0usize;
+    let mut tier4 = 0usize;
+    let mut db_missing = 0usize;
+    // 清单相对路径 → 派生索引消费口径的**绝对路径**（db-missing: 前缀行原样保留）。
+    // A1'：附件在库内落系统保留区，故与落盘侧同用 `manifest::disk_rel_path`
+    // （Tier1–3 `attachments/…` → `_attachments/…`；Tier4 的 `_unlinked_attachments/…` 原样）。
+    let abs = |rel: &str| -> String {
+        if rel.starts_with("db-missing:") {
+            rel.to_string()
+        } else {
+            library_dir
+                .join(crate::manifest::disk_rel_path(rel))
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let tx = dst.transaction().map_err(|e| e.to_string())?;
+    {
+        // 从清单（man）读附件行，写入派生索引（tx）——两者是不同连接，勿混淆
+        let mut q = man
+            .prepare(
+                "SELECT file_path, display_name, size, tier, document_guid, source
+                 FROM attachment ORDER BY file_path",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(String, String, i64, i64, Option<String>, String)> = q
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(q);
+        for (rel, display_name, size, tier, document_guid, source) in rows {
+            match tier {
+                1 => tier1 += 1,
+                2 => tier2 += 1,
+                3 => tier3 += 1,
+                4 => tier4 += 1,
+                _ => db_missing += 1,
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO attachment(file_path,attachment_guid,document_guid,display_name,size,tier,source,db_name)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, NULL)",
+                rusqlite::params![abs(&rel), document_guid, display_name, size, tier, source],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // attachment_doc（Tier3 多归属展开），file_path 同口径转绝对以匹配 join 键
+        let mut qd = man
+            .prepare("SELECT file_path, document_guid FROM attachment_doc")
+            .map_err(|e| e.to_string())?;
+        let docs: Vec<(String, String)> = qd
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(qd);
+        for (rel, g) in docs {
+            tx.execute(
+                "INSERT OR REPLACE INTO attachment_doc(file_path, document_guid) VALUES (?1, ?2)",
+                rusqlite::params![abs(&rel), g],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // ---- 用户数据还原 ----
+    for (kw, ts) in &saved_history {
+        let _ = dst.execute(
+            "INSERT INTO search_history(keyword, ts) VALUES (?1, ?2)",
+            rusqlite::params![kw, ts],
+        );
+    }
+    for (p, ex) in &saved_states {
+        let _ = dst.execute(
+            "INSERT OR REPLACE INTO folder_state(path, expanded) VALUES (?1, ?2)",
+            rusqlite::params![p, *ex as i64],
+        );
+    }
+
+    // ---- 校验报告（库口径：清单行数 == 磁盘命中 == 索引 note 行数）----
+    let ok = manifest_count == disk_hits && failed.is_empty();
+    if !ok {
+        warnings.push(format!(
+            "库索引一致性：清单 {manifest_count} 篇，磁盘命中 {disk_hits} 篇",
+        ));
+    }
+    Ok(BuildReport {
+        note_count: manifest_count,
+        source_note_count: manifest_count,
+        package_count: disk_hits,
+        tier1,
+        tier2,
+        tier3,
+        tier4,
+        db_missing,
+        elapsed_ms: t0.elapsed().as_millis(),
+        warnings,
+        ok,
+    })
+}
+
+/// 库模式正文抽取（build 全量与单篇增量共用同一口径）：zip 内正文 → 文本 → 指纹。
+///
+/// **M2 起库内正文是 `note.md`**（§20.3）：有该条目就直接取纯文本（md 本身就是纯文本，
+/// 比再走一遍 HTML 抽取更简单也更准）；没有才回退 `index.html`（历史 native 库）。
+/// 这条优先级**不是兼容分支**，而是"读侧同时支持两种库形态"的取值顺序 —— 导入流程
+/// 第③步必跑索引重建，若索引仍只认 `index.html`，md 库的索引正文会全空（软故障）。
+/// 返回 `(字符数, 指纹, 全文)`；失败返回可读错误（调用方决定记为 warning 还是 Err）。
+fn note_body_text(zip: &ZipService, guid: &str) -> Result<(i64, String, String), String> {
+    let body = if zip.has_entry(guid, crate::md::NOTE_MD) {
+        let bytes = zip
+            .read_entry(guid, crate::md::NOTE_MD)
+            .map_err(|e| e.message())?;
+        crate::zipserve::decode_utf8_sig(&bytes)
+    } else {
+        zip.read_index_html(guid).map_err(|e| e.message())?
+    };
+    let text = body;
+    Ok((text.chars().count() as i64, fingerprint(&text), text))
+}
+
+/// 库模式 folder 由 `location` 推导（无 FOLDERS_POS → `pos=i64::MAX`，前端按名称序）。
+/// `INSERT OR IGNORE`：已存在的目录行（含将来可能恢复的真实排序权重）不被覆盖。
+fn ensure_folders(dst: &Connection, location: &str) -> Result<(), String> {
+    let mut acc = String::from("/");
+    for seg in location.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+        acc = format!("{}{}/", acc, seg);
+        let trimmed = acc.trim_matches('/').to_string();
+        let name = trimmed.rsplit('/').next().unwrap_or("").to_string();
+        let parent = match trimmed.rfind('/') {
+            Some(i) => format!("/{}/", &trimmed[..i]),
+            None => String::new(),
+        };
+        dst.execute(
+            "INSERT OR IGNORE INTO folder(path, name, parent, pos) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![acc, name, parent, i64::MAX],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// `note` + `note_fts` 的一行写入（build 全量与单篇增量共用）。
+/// **先删后插**：FTS 行内容变了必须整行重建（单篇增量时旧行必须先消失）。
+struct IndexNoteRow<'a> {
+    guid: &'a str,
+    title: &'a str,
+    location: &'a str,
+    url: &'a str,
+    doc_type: &'a str,
+    created: &'a str,
+    data_modified: &'a str,
+    has_attachment: bool,
+    package_size: i64,
+    body_len: i64,
+    fingerprint: &'a str,
+    body_text: &'a str,
+}
+
+fn put_note_row(dst: &Connection, n: &IndexNoteRow<'_>) -> Result<(), String> {
+    dst.execute("DELETE FROM note WHERE guid = ?1", [n.guid])
+        .map_err(|e| e.to_string())?;
+    dst.execute("DELETE FROM note_fts WHERE guid = ?1", [n.guid])
+        .map_err(|e| e.to_string())?;
+    dst.execute(
+        "INSERT INTO note(guid,title,location,url,type,created,data_modified,has_attachment,body_text_length,body_fingerprint,package_size)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        rusqlite::params![
+            n.guid,
+            n.title,
+            n.location,
+            n.url,
+            n.doc_type,
+            n.created,
+            n.data_modified,
+            n.has_attachment,
+            n.body_len,
+            n.fingerprint,
+            n.package_size,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    dst.execute(
+        "INSERT INTO note_fts(guid,title,body,folder) VALUES (?1,?2,?3,?4)",
+        rusqlite::params![n.guid, n.title, n.body_text, n.location],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// **单篇索引增量**（§5.2 / §4.5 第 4 环）：库内写完一篇后只重建该篇。
+/// - 该篇仍在清单 → 重抽正文 + 重写 note/note_fts 行 + 补齐新 location 的 folder 祖先；
+/// - 该篇已不在清单（刚删除）→ 从索引删除该篇（folder 保留：目录树由其它篇目决定）；
+/// - 索引文件/表结构缺失 → `Err`（调用方降级为 `index_updated=false` + 提示重建，**不影响写结果**）。
+/// 调用方须保证 `resolver` 读到的是**写之后**的清单（写路径为此新建解析器）。
+pub fn update_library_note_index(
+    library_dir: &Path,
+    resolver: Arc<LibraryResolver>,
+    index_db_path: &Path,
+    guid: &str,
+) -> Result<Vec<String>, String> {
+    if !index_db_path.is_file() {
+        return Err(format!("派生索引不存在: {}", index_db_path.display()));
+    }
+    // 只读清单（G1）：写完后的权威状态
+    let man = {
+        let db = crate::manifest::manifest_path(library_dir);
+        let uri = format!("file:{}?mode=ro", url_encode_path(&db));
+        Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| format!("打开库清单失败(mode=ro): {e}"))?
+    };
+    let row: Option<(String, String, String, String, String, String, String, bool, i64)> = {
+        let mut st = man
+            .prepare(
+                "SELECT guid,title,location,ifnull(url,''),ifnull(doc_type,''),created,
+                        data_modified,has_attachment,exported_size
+                 FROM note WHERE guid = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        st.query_row([guid], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get::<_, i64>(7)? != 0,
+                r.get(8)?,
+            ))
+        })
+        .ok()
+    };
+
+    let dst = Connection::open(index_db_path)
+        .map_err(|e| format!("打开派生索引失败: {e}"))?;
+    // 表结构自检：库索引缺失/未建 → 明确报错，不建半套结构
+    dst.query_row("SELECT count(*) FROM note", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("派生索引结构不可用（请重建索引）: {e}"))?;
+
+    let mut warnings = Vec::new();
+    dst.execute("BEGIN", []).map_err(|e| e.to_string())?;
+    let res = (|| -> Result<(), String> {
+        match row {
+            None => {
+                // 已删除：索引里移除该篇
+                dst.execute("DELETE FROM note WHERE guid = ?1", [guid])
+                    .map_err(|e| e.to_string())?;
+                dst.execute("DELETE FROM note_fts WHERE guid = ?1", [guid])
+                    .map_err(|e| e.to_string())?;
+            }
+            Some((g, title, location, url, doc_type, created, data_modified, has_att, size)) => {
+                let zip = ZipService::with_resolver(resolver as Arc<dyn NotePathResolver>);
+                let (body_len, fp, body_text) = match note_body_text(&zip, &g) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        warnings.push(format!("正文重抽失败（{msg}），该篇索引正文置空"));
+                        (0, String::new(), String::new())
+                    }
+                };
+                ensure_folders(&dst, &location)?;
+                put_note_row(
+                    &dst,
+                    &IndexNoteRow {
+                        guid: &g,
+                        title: &title,
+                        location: &location,
+                        url: &url,
+                        doc_type: &doc_type,
+                        created: &created,
+                        data_modified: &data_modified,
+                        has_attachment: has_att,
+                        package_size: size,
+                        body_len,
+                        fingerprint: &fp,
+                        body_text: &body_text,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            dst.execute("COMMIT", []).map_err(|e| e.to_string())?;
+            Ok(warnings)
+        }
+        Err(e) => {
+            let _ = dst.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest;
+
+    fn write_zip(path: &Path, body: &str) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opt = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("index.html", opt).unwrap();
+        std::io::Write::write_all(&mut zw, body.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+
+    fn mk_note(guid: &str, title: &str, loc: &str, exported: &str) -> manifest::ManifestNote {
+        manifest::ManifestNote {
+            guid: guid.into(),
+            title: title.into(),
+            location: loc.into(),
+            created: "2024-01-01".into(),
+            data_modified: "2024-01-02".into(),
+            url: None,
+            doc_type: None,
+            has_attachment: false,
+            package_size: 10,
+            exported_path: exported.into(),
+            exported_size: 10,
+            exported_md5: String::new(),
+            export_mode: "native".into(),
+            exported_at: "t".into(),
+            origin: crate::manifest::ORIGIN_WIZNOTE.into(),
+            content_format: crate::manifest::FORMAT_HTML.into(),
+        }
+    }
+
+    /// temp 目录造小库（手写 export.db + 2 个真实小 zip）→ build_library_index →
+    /// 断言表结构齐全、note/folder/attachment 行数、file_path 绝对、FTS 可检索。
+    #[test]
+    fn test_build_library_index() {
+        let lib = std::env::temp_dir().join(format!("wiz-libindex-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(&lib).unwrap();
+
+        let g1 = "11111111-1111-1111-1111-111111111111";
+        let g2 = "22222222-2222-2222-2222-222222222222";
+        write_zip(&lib.join("工作/笔记一.zip"), "<html><body>苹果 banana</body></html>");
+        write_zip(&lib.join("生活/笔记二.zip"), "<html><body>橙子 orange</body></html>");
+
+        let conn = manifest::open_and_migrate(&lib).unwrap();
+        manifest::set_meta(&conn, "export_mode", "native").unwrap();
+        manifest::upsert_note(&conn, &mk_note(g1, "笔记一", "/工作/", "工作/笔记一.zip")).unwrap();
+        manifest::upsert_note(&conn, &mk_note(g2, "笔记二", "/生活/", "生活/笔记二.zip")).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO attachment(file_path,display_name,size,tier,document_guid,source)
+             VALUES ('attachments/a.log','a.log',5,1,?1,'db-record')",
+            rusqlite::params![g1],
+        )
+        .unwrap();
+        // A1'：库内附件实体落系统保留区 `_attachments/`（清单 `file_path` 仍是源相对口径）
+        std::fs::create_dir_all(lib.join(manifest::ATTACH_DIR)).unwrap();
+        std::fs::write(lib.join(manifest::ATTACH_DIR).join("a.log"), b"hello").unwrap();
+        drop(conn);
+
+        let resolver = Arc::new(LibraryResolver::new(lib.clone()).unwrap());
+        let index_db = lib.join("derived-index.db");
+        let rep = build_library_index(&lib, resolver, &index_db, &|_, _| {}).unwrap();
+
+        assert_eq!(rep.note_count, 2);
+        assert_eq!(rep.package_count, 2, "两个 zip 都应命中");
+        assert!(rep.ok, "warnings={:?}", rep.warnings);
+        assert_eq!(rep.tier1, 1);
+
+        let idx = Connection::open(&index_db).unwrap();
+        let tables: Vec<String> = {
+            let mut st = idx
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        for t in ["note", "folder", "attachment", "attachment_doc", "search_history", "folder_state"] {
+            assert!(tables.iter().any(|x| x == t), "缺表 {t}: {tables:?}");
+        }
+        assert!(tables.iter().any(|x| x == "note_fts"), "缺 FTS 表");
+        let note_rows: i64 = idx.query_row("SELECT count(*) FROM note", [], |r| r.get(0)).unwrap();
+        assert_eq!(note_rows, 2);
+        let folder_rows: i64 = idx.query_row("SELECT count(*) FROM folder", [], |r| r.get(0)).unwrap();
+        assert!(folder_rows >= 2, "至少 /工作/ 与 /生活/，实测 {folder_rows}");
+        // attachment.file_path 落绝对路径且实体存在
+        let fp: String = idx
+            .query_row("SELECT file_path FROM attachment WHERE tier=1", [], |r| r.get(0))
+            .unwrap();
+        assert!(Path::new(&fp).is_absolute(), "应绝对: {fp}");
+        assert!(Path::new(&fp).is_file(), "实体应存在: {fp}");
+        assert!(
+            fp.ends_with("_attachments/a.log"),
+            "库内附件应落保留区 `_attachments/`（A1'）: {fp}"
+        );
+        // FTS trigram 可检索正文
+        let fts_hits: i64 = idx
+            .query_row("SELECT count(*) FROM note_fts WHERE note_fts MATCH '\"banana\"'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_hits, 1);
+        // package_size 用 exported_size
+        let psz: i64 = idx
+            .query_row("SELECT package_size FROM note WHERE guid=?1", rusqlite::params![g1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(psz, 10);
+
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
 }

@@ -1,6 +1,9 @@
 //! 导出逃生舱（FR-08 / T4.0）
 //!
 //! - 单篇 zip（`index.html` + `index_files/` + 关联附件）
+//! - 批量形态两种（§20 后的库形态，见 [`ZipFormat`]）：
+//!   **native** = 源 zip 字节级拷贝（「导出数据」逃生舱，D0 恒 native）；
+//!   **md** = 库内 md 包（`note.md` 正文 + `index_files/` 原样条目，M2 起库的形态）
 //! - 单篇自包含 HTML（图片/CSS/附件以 `data:` URI 内联）
 //! - 按目录批量 / 全库按 202 个目录还原文件树（56 个非法标题净化 + 重名冲突处理）
 //! - 附件随导出带出：Tier1/2/3 → 同级 `attachments/`（剥 `{GUID}` 前缀，同名加后缀区分）；
@@ -27,8 +30,6 @@ use crate::zipserve::ZipService;
 regex_of!(re_img, r#"(?i)(<img[^>]*\ssrc=")(index_files/[^"]+)(")"#);
 regex_of!(re_link, r#"(?i)(<link[^>]*\shref=")(index_files/[^"]+)("[^>]*>)"#);
 regex_of!(re_css_url, r#"url\((['"]?)([^'")]+)(['"]?)\)"#);
-// 瘦身引用判定（FR-02）：index.html 内对 `index_files/` 资源的引用（口径同 tmp_tools/probe2.py）
-regex_of!(re_res_ref, r#"index_files/([^"')\s>]+)"#);
 
 pub struct ExportContext {
     pub notes_dir: PathBuf,
@@ -122,9 +123,16 @@ fn human_size(bytes: i64) -> String {
     }
 }
 
-/// 读取笔记 HTML 并物化代码块，返回 (html, 物化块数)
+/// 读取笔记正文（**形态自适应**，M3/§20.3）并物化代码块，返回 (可阅读 HTML, 物化块数)。
+///
+/// md 包走 [`ZipService::read_note_document`]（把 `note.md` 渲染成 HTML）；原生包原样取
+/// `index.html` —— 两种情况都得到"可直接阅读的 HTML"，与阅读态**同一条渲染口径**。
+/// 物化那一步对 md 天然是空操作（`materialize_code_blocks` 只认为知的
+/// `wiz-code-container` / 隐藏 textarea，md 渲染产物里没有这些），故不必按形态分叉。
 fn materialized_html(zip_svc: &ZipService, guid: &str) -> Result<(String, usize), String> {
-    let html = zip_svc.read_index_html(guid).map_err(|e| e.message())?;
+    let html = zip_svc
+        .read_note_document(guid, guid)
+        .map_err(|e| e.message())?;
     let (html, n) = materialize_code_blocks(&html);
     Ok((html, n))
 }
@@ -191,8 +199,12 @@ pub fn export_note_zip(
     zw.start_file("index.html", opts).map_err(|e| e.to_string())?;
     zw.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
 
+    // 导出物**恒为为知原生形态**（D0：导出只产 native）→ 正文条目必为 `index.html`（上面已写）。
+    // 源包的正文条目名则随库内形态而变（md 包是 `note.md`）→ 必须把**源包的**正文条目跳过，
+    // 否则 md 库导出的包里会同时躺着 `index.html`（新渲染）与 `note.md`（搬运来的）两份正文。
+    let src_body_entry = zip_svc.body_format(guid).entry();
     for entry in zip_svc.list_entries(guid).map_err(|e| e.message())? {
-        if entry == "index.html" {
+        if entry == src_body_entry {
             continue;
         }
         let Some(name) = safe_entry_name(&entry) else {
@@ -491,21 +503,94 @@ fn export_one_to_dir(
     Ok((copied, missing, mats, skipped))
 }
 
-// ------------------------------------- 每份笔记 zip（FR-08.1 批量形态 / FR-02 存储瘦身）
+// ------------------------------------- 每份笔记 zip（FR-08.1 批量形态）
 
-/// 每份笔记导出为一个 zip 的结果：通用报告之上补充瘦身统计与清单计数（§5）
+/// 导出模式：**恒为 `native`**（D0 全局约束「库必须无损 —— 导出只产 native」，2026-09-17 定稿）。
+/// 源 zip **字节级原样拷贝**（[`manifest::copy_with_md5`]），不重写、不增删任何条目；
+/// slim（FR-02 存储瘦身）已**整体取消**，其代码路径、UI 入口与报告产物一并移除
+/// （论证见 `docs/本地笔记读写实现.md` §4.6）。云端对象键的 `native/` 段是**冻结的协议
+/// 字面量**（见 `sync::KEY_NATIVE`），与「格式可选」无关。
+pub const EXPORT_MODE: &str = "native";
+
+/// 库内主数据格式标识：`md`（§20，M2 起由「导入到我的笔记库」产出）。
+/// 只是**格式标识**，只参与「导出 / 导入的复用比对」与库准入；云端键不变。
+pub const EXPORT_MODE_MD: &str = "md";
+
+/// 清单 meta 键：建这个 md 库时用的**转换器版本**（[`crate::md::CONVERTER_VERSION`]）。
+/// 它参与"能否复用旧包"的判定 —— 没有它就是"从未记录过"（视同陈旧，会全量重导一次）。
+pub const MD_CONVERTER_META: &str = "md_converter";
+
+/// 库/导出目录的形态（§20.3 / §4.6.4）。**同一份代码两条路径，不设兼容分支**：
+/// - [`ZipFormat::Native`]：源 zip 字节级拷贝 → **「导出数据」逃生舱专用**（D0 硬约束）；
+/// - [`ZipFormat::Md`]：库内 md 包（`index.html` → `note.md`，`index_files/` 整包搬运）→
+///   **库的形态**（「导入到我的笔记库」与 CLI `build-md-library`）。
+///
+/// 两者产出的落地路径、文件名、清单 `exported_path` **完全一致**（都是 `{标题}.zip`），
+/// 差别只在包内正文条目名 → 云端键推导与增量复用逻辑照旧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZipFormat {
+    Native,
+    Md,
+}
+
+impl ZipFormat {
+    /// 清单 `export_mode` 与 `meta.export_mode` 的取值（格式标识）
+    pub fn mode(self) -> &'static str {
+        match self {
+            ZipFormat::Native => EXPORT_MODE,
+            ZipFormat::Md => EXPORT_MODE_MD,
+        }
+    }
+
+    /// 包内正文档名（native 是为知原生的 `index.html`，md 库是 `note.md`）
+    pub fn body_entry(self) -> &'static str {
+        match self {
+            ZipFormat::Native => "index.html",
+            ZipFormat::Md => crate::md::NOTE_MD,
+        }
+    }
+
+    /// 清单 `note.content_format`（§3.3 v5）：正文的**表示形态**（与 `export_mode` 是两个维度 ——
+    /// `export_mode` 判复用、`content_format` 描述正文是 HTML 还是 Markdown）。
+    pub fn content_format(self) -> &'static str {
+        match self {
+            ZipFormat::Native => crate::manifest::FORMAT_HTML,
+            ZipFormat::Md => crate::manifest::FORMAT_MARKDOWN,
+        }
+    }
+}
+
+/// md 包转换统计（**只有 md 形态有**；native 形态为 `None`）。
+///
+/// 存在的理由：`build-md-library` 全库跑 1780 篇时，"转了几篇 / 有几篇正文空 / 围栏与表格总数"
+/// 是转换质量的**第一手体检口径**（比事后抽查 md 更快、也不会漏）。
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct MdPackStats {
+    /// 已按 md 形态落地的篇数
+    pub notes: usize,
+    /// 转换后正文为空的篇数（源正文本身为空/无可见内容）
+    pub empty_md: usize,
+    /// 空正文的样本（最多 5 条，供抽查）
+    pub empty_samples: Vec<String>,
+    /// md 正文字节合计
+    pub md_bytes: u64,
+    /// 代码围栏合计
+    pub code_fences: usize,
+    /// 其中由"代码排版表"降级而来的围栏合计
+    pub code_tables: usize,
+    /// GFM 表格合计
+    pub tables: usize,
+    /// 摊平的块级布局表合计
+    pub layout_tables: usize,
+    /// 吞掉的 CodeMirror 镜像合计
+    pub mirrors: usize,
+}
+
+/// 每份笔记导出为一个 zip 的结果：通用报告之上补充清单计数（§5）
 #[derive(Debug, serde::Serialize)]
 pub struct FolderZipExportReport {
     #[serde(flatten)]
     pub report: ExportReport,
-    /// 是否执行了 FR-02 存储瘦身
-    pub slim: bool,
-    /// 瘦身删除的冗余资源文件总数
-    pub slim_files_removed: u64,
-    /// 瘦身删除的冗余资源字节总数（解压后口径）
-    pub slim_bytes_removed: u64,
-    /// 瘦身报告 CSV 路径（slim=false 时为 None）
-    pub slim_report_path: Option<String>,
     /// 同步清单 export.db 路径（§5）
     pub manifest_path: Option<String>,
     /// 本轮新增（源库新笔记）
@@ -518,30 +603,48 @@ pub struct FolderZipExportReport {
     pub notes_removed: usize,
     /// 清单不变量自检警告（§5.5，供抽查，不中断导出）
     pub manifest_warnings: Vec<String>,
+    /// md 形态的转换统计；native 形态为 `None`
+    pub md: Option<MdPackStats>,
 }
 
-/// 单篇瘦身的体积统计（解压后口径；pub(crate) 供 manifest::rebuild 重算）
-pub(crate) struct SlimStat {
-    pub(crate) orig_files: u64,
-    pub(crate) kept_files: u64,
-    pub(crate) orig_bytes: u64,
-    pub(crate) kept_bytes: u64,
-}
-
-/// 每份笔记导出为一个 zip，输出按目录层级还原：
-/// - slim = false：逐篇**字节级原样复制**为知原生 zip 包（仅重命名为「净化标题.zip」，继承为知格式）
-/// - slim = true：FR-02 存储瘦身 —— 重建 zip，仅保留 index.html 与被其引用的 index_files/ 条目，
-///   并在目标根目录生成「瘦身报告.csv」（每篇删掉多少文件/字节，供抽查）。默认关闭，调用方须二次确认
-/// 同时维护导出根同步清单 `export.db`（manifest.rs，§5）：
-/// - 未变篇目（data_modified/package_size/模式/落地路径均未变且文件在）直接**复用现有 zip，零重写**（§6.2 第一级）
-/// - 标题/目录变更的篇目重导并按 Q4 直接删除旧路径文件
-/// - 源库已消失的篇目转入墓碑（只记录，不删文件，§6.3）
-/// 注意：原生 zip 不含附件（继承为知格式），附件随「通用文件」导出（[`export_folder`]）走；全程不改源数据。
+/// 批量导出为**每篇一个 zip**（native，D0 逃生舱）：源 zip 字节级原样复制。
+/// 见 [`export_folder_zips_fmt`] 的完整说明；`export_mode` 恒写 `native`。
 pub fn export_folder_zips(
     ctx: &ExportContext,
     location: &str,
     dest_root: &Path,
-    slim: bool,
+    progress: &dyn Fn(usize, usize),
+) -> Result<FolderZipExportReport, String> {
+    export_folder_zips_fmt(ctx, location, dest_root, ZipFormat::Native, progress)
+}
+
+/// 批量导出为**库内 md 包**（§20.3，M2：库的形态）。
+/// 与 native 的差别只有一处 —— 包内正文：`index.html` → `note.md`（`index_files/` 整包搬运）。
+/// `export_mode` 写 `md`。
+pub fn export_folder_zips_md(
+    ctx: &ExportContext,
+    location: &str,
+    dest_root: &Path,
+    progress: &dyn Fn(usize, usize),
+) -> Result<FolderZipExportReport, String> {
+    export_folder_zips_fmt(ctx, location, dest_root, ZipFormat::Md, progress)
+}
+
+/// 每份笔记导出为一个 zip，输出按目录层级还原（两种形态共用同一循环，只有"写"这一步不同）：
+/// - [`ZipFormat::Native`]：逐篇**字节级原样复制**为知原生 zip 包（仅重命名为「净化标题.zip」）
+/// - [`ZipFormat::Md`]：逐篇**转换**为库内 md 包（`note.md` + `index_files/` 原样条目）
+/// 同时维护导出根同步清单 `export.db`（manifest.rs，§5）：
+/// - 未变篇目（data_modified/package_size/落地路径均未变、清单格式标识与本次形态一致且文件在）
+///   直接**复用现有 zip，零重写**（§6.2 第一级）—— 故 native 库在 md 目标下会**全部重导**，
+///   反之亦然（格式标识参与复用比对，这是有意的：避免两种形态在同一目录里混着）
+/// - 标题/目录变更的篇目重导并按 Q4 直接删除旧路径文件
+/// - 源库已消失的篇目转入墓碑（只记录，不删文件，§6.3）
+/// 注意：原生 zip 不含附件（继承为知格式），附件随「通用文件」导出（[`export_folder`]）走；全程不改源数据。
+pub fn export_folder_zips_fmt(
+    ctx: &ExportContext,
+    location: &str,
+    dest_root: &Path,
+    fmt: ZipFormat,
     progress: &dyn Fn(usize, usize),
 ) -> Result<FolderZipExportReport, String> {
     let t0 = std::time::Instant::now();
@@ -549,31 +652,38 @@ pub fn export_folder_zips(
     let conn = open_index_ro(ctx)?;
     let notes = load_notes(&conn, location)?;
     let plan = plan_zip_paths(&notes);
-    let mode = if slim { "slim" } else { "native" };
 
     // 同步清单（§5）：建库载入旧行，供增量复用判定（§6.2 第一级）
     let mconn = manifest::open_or_create(dest_root)?;
     let prev_rows = manifest::load_notes(&mconn)?;
+    // **转换器版本闸门**（M3/§20.3）：md 形态下，若本目录上一次是用**别的**转换器版本建的
+    // （或从未记录过），则**整体放弃复用、全量重导** —— 否则「改进转换器」这件事永远
+    // 落不进已有的 md 库（源没变、清单没变 ⇒ 判定为可复用 ⇒ 老正文一直留着）。
+    // 只对 md 形态生效：native 是字节拷贝，与转换器无关。
+    let md_conv = manifest::get_meta(&mconn, MD_CONVERTER_META)?.unwrap_or_default();
+    let md_conv_stale = fmt == ZipFormat::Md && md_conv != crate::md::CONVERTER_VERSION;
+    let mut pre_warnings: Vec<String> = Vec::new();
+    if md_conv_stale {
+        pre_warnings.push(format!(
+            "转换器版本变更（清单记录 {} → 当前 {}）：除库内已本地修改的篇目外，本次全量重导",
+            if md_conv.is_empty() { "(无)" } else { md_conv.as_str() },
+            crate::md::CONVERTER_VERSION
+        ));
+    }
+    // P2 覆盖守卫：库内被本地写过的篇目（行级 revision > 0）**不参与**从源重导，
+    // 否则一次「导入到我的笔记库」就会静默抹掉用户的编辑（§15.7 R14）。
+    // 逃生舱导出（目标非库根）不受影响：那种目标目录没有清单，集合恒空。
+    let locally_edited = manifest::load_dirty_guids(&mconn)?;
 
     let mut skipped = Vec::new();
     let mut notes_exported = 0usize;
     let mut notes_added = 0usize;
     let mut notes_reexported = 0usize;
     let mut notes_reused = 0usize;
-    let mut slim_files_removed = 0u64;
-    let mut slim_bytes_removed = 0u64;
-
-    // 瘦身报告（FR-02.4）：BOM 让 Excel 正确识别 UTF-8；复用篇目的统计从清单行带出
-    let mut csv: Option<(PathBuf, File)> = if slim {
-        let p = dest_root.join("瘦身报告.csv");
-        let mut f = File::create(&p).map_err(|e| e.to_string())?;
-        f.write_all(
-            "\u{feff}标题,目录,原文件数,保留文件数,删除文件数,原字节,保留字节,删除字节\n".as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        Some((p, f))
-    } else {
-        None
+    // md 形态的转换统计（native 形态保持 None）
+    let mut md_stats: Option<MdPackStats> = match fmt {
+        ZipFormat::Md => Some(MdPackStats::default()),
+        ZipFormat::Native => None,
     };
 
     let mut made_dirs: HashSet<PathBuf> = HashSet::new();
@@ -594,23 +704,35 @@ pub fn export_folder_zips(
         // 源包：notes/{GUID}（带花括号、无扩展名）
         let src = ctx.notes_dir.join(format!("{{{}}}", n.guid));
 
-        // 增量复用判定（§6.2 第一级）：源字段/模式/落地路径均未变且文件在 → 零重写
+        // P2 覆盖守卫（先于复用判定）：库内版本是用户改过的，重导会用源版本覆盖 → 拒绝并报告
+        if locally_edited.contains(&n.guid) {
+            notes_exported += 1;
+            notes_reused += 1;
+            skipped.push(format!(
+                "{}「{}」库内已本地修改，跳过覆盖（保留库内版本）",
+                n.guid, n.title
+            ));
+            if (i + 1) % 50 == 0 || i + 1 == total {
+                progress(i + 1, total);
+            }
+            continue;
+        }
+
+        // 增量复用判定（§6.2 第一级）：源字段/格式标识/落地路径均未变、文件在，
+        // 且**转换器版本未变**（md 形态：版本变了就要按新口径重导）→ 零重写
         let prev = prev_rows.get(&n.guid);
-        let unchanged = matches!(&prev, Some(o)
-            if o.data_modified == n.data_modified
-                && o.package_size == n.package_size
-                && o.export_mode == mode
-                && o.exported_path == p.rel_path
-                && dest.is_file());
+        let unchanged = !md_conv_stale
+            && matches!(&prev, Some(o)
+                if o.data_modified == n.data_modified
+                    && o.package_size == n.package_size
+                    && o.export_mode == fmt.mode()
+                    && o.exported_path == p.rel_path
+                    && dest.is_file());
 
         if unchanged {
             notes_reused += 1;
             notes_exported += 1;
             let o = prev.unwrap();
-            if slim {
-                let (orig_f, kept_f, orig_b, kept_b) = slim_stat_from_row(o);
-                write_slim_csv_row(&mut csv, &n.title, &n.location, orig_f, kept_f, orig_b, kept_b);
-            }
             // 源库元数据仍刷新（url/标题等可能变了）；exported_* 与 exported_at 保持不变
             manifest::upsert_note(
                 &mconn,
@@ -628,13 +750,21 @@ pub fn export_folder_zips(
                     exported_size: o.exported_size,
                     exported_md5: o.exported_md5.clone(),
                     export_mode: o.export_mode.clone(),
-                    entry_count: o.entry_count,
-                    removed_files: o.removed_files,
-                    removed_bytes: o.removed_bytes,
-                    kept_bytes: o.kept_bytes,
                     exported_at: o.exported_at.clone(),
+                    // 复用支：内容直存原文 → 来源恒为「导入自源」；正文形态与本次 fmt 一致
+                    // （`fmt.mode() == o.export_mode` 是走上这一支的前提）
+                    origin: manifest::ORIGIN_WIZNOTE.into(),
+                    content_format: fmt.content_format().into(),
                 },
             )?;
+            // v6：复用支只刷新**源库元数据**（url/标题/目录），内容字节没动 ⇒ 只可能脏 `info` 段。
+            // **必须按实差置脏**：无条件置脏会让每跑一次导出就把全库标脏 ⇒ 每次同步都重传清单、
+            // 版本号空转（水位失去意义）。而完全不置脏则会让源库里的改名/搬家永远传不上去。
+            let info_changed = o.title != n.title
+                || o.location != n.location
+                || o.url != n.url
+                || o.doc_type != n.doc_type;
+            manifest::mark_note_dirty(&mconn, &n.guid, info_changed, false)?;
         } else {
             // 标题/目录变更遗留旧文件：Q4 直接删除（导出目录是派生物）
             if let Some(o) = prev {
@@ -645,45 +775,41 @@ pub fn export_folder_zips(
                     }
                 }
             }
-            let write = || -> Result<(SlimStat, String, i64), String> {
-                if slim {
-                    let stat = slim_build_zip(&src, &dest)?;
-                    // slim：重建后算 MD5（§9.1 Q2）
-                    let md5 = manifest::md5_file(&dest)?;
-                    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                    Ok((stat, md5, size as i64))
-                } else {
-                    // native：边拷边算 MD5，不做二次读盘（§9.1 Q2）
-                    let (len, md5) = manifest::copy_with_md5(&src, &dest)?;
-                    Ok((
-                        SlimStat { orig_files: 0, kept_files: 0, orig_bytes: 0, kept_bytes: 0 },
-                        md5,
-                        len as i64,
-                    ))
+            // native：边拷边算 MD5，不做二次读盘（§9.1 Q2）；md：整包重写成 md 包（§20.3）
+            let write = || -> Result<(String, i64, Option<MdPackWrite>), String> {
+                match fmt {
+                    ZipFormat::Native => {
+                        let (len, md5) = manifest::copy_with_md5(&src, &dest)?;
+                        Ok((md5, len as i64, None))
+                    }
+                    ZipFormat::Md => {
+                        let w = write_md_package(&src, &dest)?;
+                        Ok((w.md5.clone(), w.size, Some(w)))
+                    }
                 }
             };
             match write() {
-                Ok((stat, md5, size)) => {
+                Ok((md5, size, pack)) => {
                     notes_exported += 1;
                     if prev.is_some() {
                         notes_reexported += 1;
                     } else {
                         notes_added += 1;
                     }
-                    if slim {
-                        let removed_files = stat.orig_files.saturating_sub(stat.kept_files);
-                        let removed_bytes = stat.orig_bytes.saturating_sub(stat.kept_bytes);
-                        slim_files_removed += removed_files;
-                        slim_bytes_removed += removed_bytes;
-                        write_slim_csv_row(
-                            &mut csv,
-                            &n.title,
-                            &n.location,
-                            stat.orig_files,
-                            stat.kept_files,
-                            stat.orig_bytes,
-                            stat.kept_bytes,
-                        );
+                    if let (Some(acc), Some(w)) = (md_stats.as_mut(), pack) {
+                        acc.notes += 1;
+                        acc.md_bytes += w.md_len;
+                        acc.code_fences += w.stats.code_blocks;
+                        acc.code_tables += w.stats.code_tables;
+                        acc.tables += w.stats.tables;
+                        acc.layout_tables += w.stats.layout_tables;
+                        acc.mirrors += w.stats.mirrors;
+                        if w.empty {
+                            acc.empty_md += 1;
+                            if acc.empty_samples.len() < 5 {
+                                acc.empty_samples.push(format!("{}「{}」", n.guid, n.title));
+                            }
+                        }
                     }
                     // exported_at 取落地文件 mtime：与重建入口（manifest::rebuild）同源，保证重建结果逐字段一致
                     let exported_at = std::fs::metadata(&dest)
@@ -705,14 +831,23 @@ pub fn export_folder_zips(
                             exported_path: p.rel_path.clone(),
                             exported_size: size,
                             exported_md5: md5,
-                            export_mode: mode.to_string(),
-                            entry_count: slim.then(|| stat.kept_files),
-                            removed_files: slim.then(|| stat.orig_files.saturating_sub(stat.kept_files)),
-                            removed_bytes: slim.then(|| stat.orig_bytes.saturating_sub(stat.kept_bytes)),
-                            kept_bytes: slim.then(|| stat.kept_bytes),
+                            export_mode: fmt.mode().to_string(),
                             exported_at,
+                            // 重导支：内容来自源库 → 来源「导入自源」；形态随 fmt（md 库 = markdown）
+                            origin: manifest::ORIGIN_WIZNOTE.into(),
+                            content_format: fmt.content_format().into(),
                         },
                     )?;
+                    // v6：重导支 = 包内字节被重写 ⇒ `data` 段必脏（新 md5 要上云）；
+                    // `info` 段按实差（标题/目录变过才置），口径与复用支一致。
+                    let info_changed = prev
+                        .map(|o| {
+                            o.title != n.title
+                                || o.location != n.location
+                                || o.exported_path != p.rel_path
+                        })
+                        .unwrap_or(true);
+                    manifest::mark_note_dirty(&mconn, &n.guid, info_changed, true)?;
                 }
                 Err(e) => {
                     skipped.push(format!("{}: {}", n.guid, e));
@@ -724,24 +859,33 @@ pub fn export_folder_zips(
             progress(i + 1, total);
         }
     }
-    let slim_report_path = csv
-        .as_ref()
-        .map(|(p, _)| p.to_string_lossy().into_owned());
-    drop(csv);
-
     // 墓碑收敛：源库已消失（全库口径）的清单行转 deleted（§6.3，只记录不删文件）
     let all_guids = load_all_guids(&conn)?;
     let now = manifest::format_utc(std::time::SystemTime::now());
     let tombstoned = manifest::reconcile_tombstones(&mconn, &all_guids, &now)?;
-    // meta：revision 单调递增（§8，未来多端新旧判定）；源目录与工具版本存档
-    manifest::bump_revision(&mconn, &now)?;
+    // v6（`docs/云同步逻辑.md` §8 作废清单第 2 条）：**导出不再铸版**。
+    // 原处分是 `bump_revision`（"revision 单调递增，未来多端新旧判定"）—— 那是旧口径
+    // （拿清单计数器当同步判据）的遗留。新口径下 `meta.revision` 只在**云同步上行提交点**
+    // 推进，建库/重导路径只置脏闩（后者已由 `upsert_note` 的 INSERT 支与下面两处置脏覆盖）。
     manifest::set_meta(&mconn, "exported_at", &now)?;
-    manifest::set_meta(&mconn, "export_mode", mode)?;
+    manifest::set_meta(&mconn, "export_mode", fmt.mode())?;
     manifest::set_meta(&mconn, "source_data_dir", &ctx.notes_dir.to_string_lossy())?;
     manifest::set_meta(&mconn, "tool_version", env!("CARGO_PKG_VERSION"))?;
+    // md 库额外记一条**转换器版本**（M3）：它决定"下次能否复用"，必须与包内正文的实际
+    // 生成口径一致。native 形态清掉它 —— 免得日后同一目录换成 md 形态时误判为"版本未变"。
+    manifest::set_meta(
+        &mconn,
+        MD_CONVERTER_META,
+        if fmt == ZipFormat::Md {
+            crate::md::CONVERTER_VERSION
+        } else {
+            ""
+        },
+    )?;
 
     // 不变量自检（§5.5）：警告进报告，不中断导出
-    let manifest_warnings = manifest::check_invariants(&mconn, dest_root)?;
+    let mut manifest_warnings = manifest::check_invariants(&mconn, dest_root)?;
+    manifest_warnings.splice(0..0, pre_warnings);
 
     Ok(FolderZipExportReport {
         report: ExportReport {
@@ -749,178 +893,109 @@ pub fn export_folder_zips(
             attachments_exported: 0,
             attachments_missing: 0,
             folders_exported: made_dirs.len(),
-            code_blocks_materialized: 0,
+            // native 不物化代码块（源 zip 原样搬）；md 形态如实报"产出的代码围栏数"
+            code_blocks_materialized: md_stats.as_ref().map(|s| s.code_fences).unwrap_or(0),
             skipped,
             elapsed_ms: t0.elapsed().as_millis(),
         },
-        slim,
-        slim_files_removed,
-        slim_bytes_removed,
-        slim_report_path,
         manifest_path: Some(manifest::manifest_path(dest_root).to_string_lossy().into_owned()),
         notes_added,
         notes_reexported,
         notes_reused,
         notes_removed: tombstoned.len(),
         manifest_warnings,
+        md: md_stats,
     })
 }
 
-/// 从清单行反推瘦身四元组（原文件数，保留文件数，原字节，保留字节）供 CSV 复用行
-fn slim_stat_from_row(o: &manifest::ManifestNote) -> (u64, u64, u64, u64) {
-    let kept_f = o.entry_count.unwrap_or(0);
-    let rb = o.removed_bytes.unwrap_or(0);
-    let kb = o.kept_bytes.unwrap_or(0);
-    (kept_f + o.removed_files.unwrap_or(0), kept_f, kb + rb, kb)
+// ------------------------------------------------------ md 包构建（§20.3 / M2）
+
+/// 一次 md 包写盘的结果
+struct MdPackWrite {
+    /// 落地 zip 的 MD5（清单行用）
+    md5: String,
+    /// 落地 zip 的字节数
+    size: i64,
+    /// 包内 `note.md` 的字节数
+    md_len: u64,
+    /// 正文转换后为空（`note.md` 去空白后为空串）
+    empty: bool,
+    /// 转换统计
+    stats: crate::md::MdStats,
 }
 
-/// 瘦身报告一行（列序：标题,目录,原文件数,保留文件数,删除文件数,原字节,保留字节,删除字节）
-fn write_slim_csv_row(
-    csv: &mut Option<(PathBuf, File)>,
-    title: &str,
-    loc: &str,
-    orig_files: u64,
-    kept_files: u64,
-    orig_bytes: u64,
-    kept_bytes: u64,
-) {
-    if let Some((_, f)) = csv.as_mut() {
-        let _ = writeln!(
-            f,
-            "{},{},{},{},{},{},{},{}",
-            csv_cell(title),
-            csv_cell(loc),
-            orig_files,
-            kept_files,
-            orig_files.saturating_sub(kept_files),
-            orig_bytes,
-            kept_bytes,
-            orig_bytes.saturating_sub(kept_bytes)
-        );
-    }
+/// 同目录临时文件名：`{name}.zip` → `{name}.zip.tmp`（拼接后缀，不替换扩展名）
+fn tmp_beside(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
-/// FR-02 瘦身的确定性统计：读源 zip 计算（保留判定与报告口径），不写任何文件。
-/// pub(crate) 供 manifest::rebuild 重算统计（导出/重建结果逐字段一致的前提）
-pub(crate) fn slim_stat_of(src: &Path) -> Result<(SlimStat, Vec<String>), String> {
-    let file = File::open(src).map_err(|e| e.to_string())?;
-    let mut ar = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+/// 把**源原生 zip** 转成**库内 md 包**（§20.3，M2）：
+/// - 包内正文：`index.html`（剥 BOM 解码）→ [`crate::md::html_to_md`] → **`note.md`**（UTF-8 无 BOM）；
+/// - **其余条目整包搬运**：`index_files/...` 用 [`zip::ZipWriter::raw_copy_file`] 原样复制 ——
+///   条目名、压缩方式、压缩后的字节都不变（附件名一个不改，md 里仍写 `![](index_files/xxx)`）；
+/// - 原子性：先写同目录 `{name}.zip.tmp` → `flush` → `sync_all`(fsync) → **rename 覆盖**；
+///   任何一步失败就删 tmp，**原有文件不动**（与 [`crate::library::rewrite_note_zip`] 同口径）。
+///
+/// 与 `rewrite_note_zip` 的分工：那个是**改**已有 md 包（M3 的 `save_note_md`），
+/// 这个是**从源 zip 生成** md 包（导入路径），故临时文件名与失败语义相同、用途不同。
+fn write_md_package(src: &Path, dest: &Path) -> Result<MdPackWrite, String> {
+    let tmp = tmp_beside(dest);
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| -> Result<MdPackWrite, String> {
+        let src_file = File::open(src).map_err(|e| format!("打开源包失败 {}: {e}", src.display()))?;
+        let mut ar = zip::ZipArchive::new(src_file).map_err(|e| format!("源包不是合法 zip: {e}"))?;
 
-    // index.html 原始字节（含 BOM，P9：解码仅用于提取引用）
-    let html_bytes = {
-        let mut f = ar.by_name("index.html").map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        buf
-    };
-    let refs = referenced_names(&crate::zipserve::decode_utf8_sig(&html_bytes));
+        // ① 读源正文（为知实测 100% 带 UTF-8 BOM → 按 utf-8-sig 解码）
+        let html = {
+            let mut e = ar
+                .by_name("index.html")
+                .map_err(|e| format!("源包内无 index.html: {e}"))?;
+            let mut b = Vec::new();
+            e.read_to_end(&mut b).map_err(|e| e.to_string())?;
+            crate::zipserve::decode_utf8_sig(&b)
+        };
+        let (md, stats) = crate::md::html_to_md_with_stats(&html);
 
-    // 条目清单（名字 + 解压后体积），用于保留判定与瘦身报告统计
-    let names: Vec<(String, u64)> = (0..ar.len())
-        .filter_map(|i| ar.by_index(i).ok().map(|f| (f.name().to_string(), f.size())))
-        .collect();
-    let kept: Vec<(String, u64)> = names
-        .iter()
-        .filter(|(n, _)| entry_referenced(n, &refs))
-        .cloned()
-        .collect();
-    let stat = SlimStat {
-        orig_files: names.len() as u64,
-        kept_files: kept.len() as u64,
-        orig_bytes: names.iter().map(|(_, s)| *s).sum(),
-        kept_bytes: kept.iter().map(|(_, s)| *s).sum(),
-    };
-    Ok((stat, kept.into_iter().map(|(n, _)| n).collect()))
-}
-
-/// FR-02 瘦身重建：仅保留 index.html + 被引用的 index_files/ 条目，输出新 zip。
-/// 实测预期（需求文档 FR-02）：解压口径 2,428.5 MB → 1,330.5 MB（-45.2%），48,840 → 16,683 个文件
-fn slim_build_zip(src: &Path, dest: &Path) -> Result<SlimStat, String> {
-    let (stat, kept) = slim_stat_of(src)?;
-    let file = File::open(src).map_err(|e| e.to_string())?;
-    let mut ar = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    // index.html 原始字节（含 BOM，P9：原样写入不回写）
-    let html_bytes = {
-        let mut f = ar.by_name("index.html").map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        buf
-    };
-
-    let out = File::create(dest).map_err(|e| e.to_string())?;
-    let mut zw = ZipWriter::new(out);
-    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    zw.start_file("index.html", opts).map_err(|e| e.to_string())?;
-    zw.write_all(&html_bytes).map_err(|e| e.to_string())?;
-    for name in &kept {
-        if name == "index.html" {
-            continue;
+        // ② 组装：note.md 打头（与原 index.html 的位置一致），其余条目原样搬运
+        let out = File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut zw = ZipWriter::new(out);
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file(crate::md::NOTE_MD, opts).map_err(|e| e.to_string())?;
+        zw.write_all(md.as_bytes()).map_err(|e| e.to_string())?;
+        for i in 0..ar.len() {
+            let entry = ar.by_index(i).map_err(|e| format!("读 zip 条目 {i} 失败: {e}"))?;
+            let name = entry.name().to_string();
+            // 正文条目换成 note.md；源里若本就有 note.md（不该有）也不重复写
+            if name == "index.html" || name == crate::md::NOTE_MD {
+                continue;
+            }
+            zw.raw_copy_file(entry)
+                .map_err(|e| format!("搬运条目 {name} 失败: {e}"))?;
         }
-        let mut f = ar.by_name(name).map_err(|e| e.to_string())?;
-        // 落地名走 safe_entry_name 防护（P10 怪异后缀原样保留）
-        let out_name = safe_entry_name(name).unwrap_or_else(|| name.clone());
-        zw.start_file(out_name.as_str(), opts).map_err(|e| e.to_string())?;
-        std::io::copy(&mut f, &mut zw).map_err(|e| e.to_string())?;
-    }
-    zw.finish().map_err(|e| e.to_string())?;
-    Ok(stat)
-}
+        let mut out = zw.finish().map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        out.sync_all().map_err(|e| e.to_string())?;
+        drop(out);
+        drop(ar); // Windows 上必须先释放源句柄才能 rename 覆盖
 
-/// index.html 引用的资源名集合（`index_files/` 之后的剩余路径）。
-/// 兼容 HTML 内 percent 编码与 zip 内原名两种形态（probe2.py 口径 + 编码解码补充）。
-/// 实测数据中存在 `src=&quot;index_files/x.png&quot;` 实体引号形态：先在实体定界符处截断，
-/// 再把 `&amp;` 还原为 `&`，否则会把实体字符带进文件名导致误判未引用（实测 12 处）
-fn referenced_names(html: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for c in re_res_ref().captures_iter(html) {
-        let mut raw = c[1].to_string();
-        // 实体定界符（&quot;/&#39; 等）说明文件名到此为止，先截断；
-        // &amp; 属于文件名本身（文件名含 & 时 HTML 必然这样写），截断后还原
-        let cut = raw
-            .find("&quot;")
-            .or_else(|| raw.find("&#39;"))
-            .or_else(|| raw.find("&apos;"));
-        if let Some(i) = cut {
-            out.insert(raw.clone()); // 原串也入集合（宽松保留，无害）
-            raw.truncate(i);
-        }
-        if raw.contains("&amp;") {
-            out.insert(raw.clone());
-            raw = raw.replace("&amp;", "&");
-        }
-        out.insert(raw.clone());
-        let decoded = percent_encoding::percent_decode_str(&raw)
-            .decode_utf8_lossy()
-            .into_owned();
-        if decoded != raw {
-            out.insert(decoded);
-        }
+        let size = std::fs::metadata(&tmp).map_err(|e| e.to_string())?.len() as i64;
+        let md5 = manifest::md5_file(&tmp)?;
+        std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+        Ok(MdPackWrite {
+            md5,
+            size,
+            md_len: md.len() as u64,
+            empty: md.trim().is_empty(),
+            stats,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    out
-}
-
-/// 条目是否保留：index.html 必留；index_files/ 条目仅限被引用的（FR-02.1）
-fn entry_referenced(entry: &str, refs: &HashSet<String>) -> bool {
-    if entry == "index.html" {
-        return true;
-    }
-    let Some(rest) = entry.strip_prefix("index_files/") else {
-        return false;
-    };
-    if refs.contains(rest) {
-        return true;
-    }
-    // probe2.py 口径：按文件名匹配（网页剪藏资源基本平铺在 index_files/ 下）
-    rest.rsplit('/').next().is_some_and(|b| refs.contains(b))
-}
-
-/// CSV 单元格转义：含逗号/引号/换行时加引号并双写内部引号
-fn csv_cell(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+    result
 }
 
 // ------------------------------------------------------ 索引读取
@@ -1212,35 +1287,64 @@ mod tests {
         );
     }
 
+    /// D0 回归护栏（`云同步模块设计-阶段二.md` §0 第 10 条 / `本地笔记读写实现.md` §4.6）：
+    /// 导出产物必须与源 zip **逐字节一致**，模式恒 `native`，且不再产生 slim 统计与瘦身报告。
     #[test]
-    fn test_referenced_names_and_entry_filter() {
-        let html = r#"<img src="index_files/a-b.png"><link href="index_files/x%20y.css">
-        <img src="index_files/z.png"><img src="https://elsewhere.com/i.png">"#;
-        let refs = referenced_names(html);
-        assert!(refs.contains("a-b.png"));
-        assert!(refs.contains("x y.css")); // percent 解码后命中
-        assert!(refs.contains("x%20y.css")); // 原名也命中（zip 内两种形态都能匹配）
-        assert!(refs.contains("z.png"));
-        // 实体引号形态（实测 CSDN 剪藏）：&quot; 定界符要截断；&amp; 属于文件名本身要还原
-        let html2 = r#"<img src=&quot;index_files/gitcode-key.png&quot;><img src="index_files/a&amp;b.png">"#;
-        let refs2 = referenced_names(html2);
-        assert!(refs2.contains("gitcode-key.png"));
-        assert!(refs2.contains("a&b.png"));
-        assert!(!refs2.contains("i.png")); // 远程引用不进集合
+    fn test_native_export_is_byte_identical() {
+        let d = std::env::temp_dir().join(format!("wiz-export-d0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let notes_dir = d.join("data").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
 
-        assert!(entry_referenced("index.html", &refs));
-        assert!(entry_referenced("index_files/z.png", &refs));
-        assert!(entry_referenced("index_files/x y.css", &refs));
-        assert!(entry_referenced("index_files/x%20y.css", &refs)); // zip 内原名（含空格）经解码命中
-        assert!(!entry_referenced("index_files/unused_font.woff", &refs));
-        assert!(!entry_referenced("other/a b.png", &refs));
-    }
+        // 最小源库：native 是字节级拷贝、不解析 zip 内容，故任意字节即可（含 0x00 与高位字节）
+        let guid = "11111111-2222-3333-4444-555555555555";
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(notes_dir.join(format!("{{{guid}}}")), &bytes).unwrap();
 
-    #[test]
-    fn test_csv_cell() {
-        assert_eq!(csv_cell("plain"), "plain");
-        assert_eq!(csv_cell("a,b"), "\"a,b\"");
-        assert_eq!(csv_cell("说\"话"), "\"说\"\"话\"");
+        let index_db = d.join("index.db");
+        {
+            let c = Connection::open(&index_db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE note (guid TEXT PRIMARY KEY, title TEXT, location TEXT, created TEXT, \
+                 data_modified TEXT, url TEXT, type TEXT, has_attachment INTEGER, package_size INTEGER);",
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO note VALUES (?1, 'T', '/d/', 'c', 'm', NULL, NULL, 0, 4096)",
+                [guid],
+            )
+            .unwrap();
+        }
+
+        let ctx = ExportContext::new(notes_dir.clone(), index_db);
+        let dest = d.join("export");
+        let rep = export_folder_zips(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep.report.notes_exported, 1);
+        assert!(rep.report.skipped.is_empty(), "{:?}", rep.report.skipped);
+
+        let mconn = manifest::open_and_migrate(&dest).unwrap();
+        let rows = manifest::load_notes(&mconn).unwrap();
+        let row = rows.get(guid).unwrap();
+        let exported = dest.join(&row.exported_path);
+
+        // ① 字节级一致（D0 的核心不变量）
+        assert_eq!(std::fs::read(&exported).unwrap(), bytes, "D0：导出必须是源 zip 的字节级拷贝");
+        assert_eq!(
+            manifest::md5_file(&exported).unwrap(),
+            manifest::md5_file(&notes_dir.join(format!("{{{guid}}}"))).unwrap()
+        );
+        // ② 格式标识恒 native
+        assert_eq!(
+            manifest::get_meta(&mconn, "export_mode").unwrap().as_deref(),
+            Some(EXPORT_MODE)
+        );
+        assert_eq!(row.export_mode, EXPORT_MODE);
+        // ③ 二次导出走复用路径（格式标识一致才复用 → 反证清单里已是 native）
+        let rep2 = export_folder_zips(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep2.notes_reused, 1, "格式标识一致才复用：未变篇目应零重写");
+        assert_eq!(std::fs::read(&exported).unwrap(), bytes);
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1275,5 +1379,298 @@ mod tests {
         assert!(html.contains("href=\"attachments/a.log\""));
         assert!(html.contains("文件未随导出下载"));
         assert!(html.contains("附件（2）"));
+    }
+
+    // ---------------- M2：md 包（§20.3） ----------------
+
+    /// 读 zip 全部条目名（顺序保留）
+    fn zip_names(p: &Path) -> Vec<String> {
+        let f = std::fs::File::open(p).unwrap();
+        let mut ar = zip::ZipArchive::new(f).unwrap();
+        (0..ar.len())
+            .map(|i| ar.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// 读某条目原始字节（不存在 → None）
+    fn zip_bytes(p: &Path, name: &str) -> Option<Vec<u8>> {
+        let f = std::fs::File::open(p).unwrap();
+        let mut ar = zip::ZipArchive::new(f).unwrap();
+        let mut e = ar.by_name(name).ok()?;
+        let mut b = Vec::new();
+        e.read_to_end(&mut b).unwrap();
+        Some(b)
+    }
+
+    /// 造一个最小源库（`notes/{GUID}` = 带 BOM 的 index.html + 若干 index_files 条目）
+    fn make_source_note(notes_dir: &Path, guid: &str, html: &str, assets: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(notes_dir).unwrap();
+        let f = std::fs::File::create(notes_dir.join(format!("{{{guid}}}"))).unwrap();
+        let mut zw = ZipWriter::new(f);
+        let opt = SimpleFileOptions::default();
+        zw.start_file("index.html", opt).unwrap();
+        zw.write_all(&[0xEF, 0xBB, 0xBF]).unwrap(); // 真实语料 100% 带 BOM
+        zw.write_all(html.as_bytes()).unwrap();
+        for (name, bytes) in assets {
+            zw.start_file(*name, opt).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        let mut out = zw.finish().unwrap();
+        out.flush().unwrap();
+    }
+
+    /// 造最小源索引（note 表一行）
+    fn make_source_index(path: &Path, guid: &str, size: i64) {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE note (guid TEXT PRIMARY KEY, title TEXT, location TEXT, created TEXT, \
+             data_modified TEXT, url TEXT, type TEXT, has_attachment INTEGER, package_size INTEGER);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO note VALUES (?1, '标题一', '/d/', 'c', 'm', NULL, NULL, 0, ?2)",
+            rusqlite::params![guid, size],
+        )
+        .unwrap();
+    }
+
+    /// M2 核心（§20.3）：包内 `index.html` → `note.md`，`index_files/` **原样搬运**；
+    /// 清单行与 meta 的 `export_mode` 都是 `md`；二次跑走复用；换回 native 会**全部重导**
+    /// （格式标识参与复用比对 —— 这条同时是"两种形态不会在同一目录里混着"的护栏）。
+    #[test]
+    fn test_md_package_replaces_body_keeps_assets() {
+        let d = std::env::temp_dir().join(format!("wiz-export-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let notes_dir = d.join("data").join("notes");
+        let guid = "11111111-2222-3333-4444-555555555555";
+        let html = "<html><body><h1>标题一</h1><div>正文 <b>粗体</b></div>\
+                    <pre><code class=\"language-rust\">let a = 1;</code></pre>\
+                    <img src=\"index_files/pic.png\"></body></html>";
+        let png: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
+        let css = b".x{color:red}".to_vec();
+        make_source_note(
+            &notes_dir,
+            guid,
+            html,
+            &[
+                ("index_files/pic.png", png.as_slice()),
+                ("index_files/a.css", css.as_slice()),
+            ],
+        );
+
+        let index_db = d.join("index.db");
+        let src_size = std::fs::metadata(notes_dir.join(format!("{{{guid}}}"))).unwrap().len() as i64;
+        make_source_index(&index_db, guid, src_size);
+
+        let ctx = ExportContext::new(notes_dir.clone(), index_db);
+        let dest = d.join("lib");
+        let rep = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep.report.notes_exported, 1);
+        assert!(rep.report.skipped.is_empty(), "{:?}", rep.report.skipped);
+
+        let mconn = manifest::open_and_migrate(&dest).unwrap();
+        let rows = manifest::load_notes(&mconn).unwrap();
+        let row = rows.get(guid).unwrap();
+        let pkg = dest.join(&row.exported_path);
+
+        // ① 包结构：note.md + index_files/*，**没有** index.html
+        let names = zip_names(&pkg);
+        assert_eq!(names.first().map(|s| s.as_str()), Some(crate::md::NOTE_MD), "{names:?}");
+        assert!(names.contains(&"index_files/pic.png".to_string()), "{names:?}");
+        assert!(names.contains(&"index_files/a.css".to_string()), "{names:?}");
+        assert!(!names.contains(&"index.html".to_string()), "index.html 必须被 note.md 取代");
+
+        // ② 正文 = 转换器输出（逐字节一致，说明包内正文就是 md.rs 的产物）
+        let md = String::from_utf8(zip_bytes(&pkg, crate::md::NOTE_MD).unwrap()).unwrap();
+        assert_eq!(md, crate::md::html_to_md(html));
+        assert!(md.contains("# 标题一"), "{md}");
+        assert!(md.contains("```rust"), "{md}");
+        assert!(md.contains("![](index_files/pic.png)"), "{md}");
+
+        // ③ 随包条目**原样搬运**（字节级）
+        assert_eq!(zip_bytes(&pkg, "index_files/pic.png").unwrap(), png);
+        assert_eq!(zip_bytes(&pkg, "index_files/a.css").unwrap(), css);
+
+        // ④ 落地路径与文件名与 native 一致（云端键推导不变的前提）
+        assert!(row.exported_path.ends_with(".zip"), "{}", row.exported_path);
+        // ⑤ 格式标识：行 + meta 都是 md
+        assert_eq!(row.export_mode, EXPORT_MODE_MD);
+        assert_eq!(
+            manifest::get_meta(&mconn, "export_mode").unwrap().as_deref(),
+            Some(EXPORT_MODE_MD)
+        );
+        // ⑥ 转换统计
+        let md_stats = rep.md.as_ref().expect("md 形态必须带回统计");
+        assert_eq!(md_stats.notes, 1);
+        assert_eq!(md_stats.empty_md, 0);
+        assert!(md_stats.code_fences >= 1, "{md_stats:?}");
+        assert!(md_stats.md_bytes > 0);
+
+        // ⑦ 二次运行：格式/源字段/路径都没变 → 零重写（清单 MD5 不变）
+        let before = manifest::md5_file(&pkg).unwrap();
+        let rep2 = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep2.notes_reused, 1, "md → md 应复用");
+        assert_eq!(manifest::md5_file(&pkg).unwrap(), before);
+
+        // ⑧ 反向：换 native 导出到同一目录 → 格式标识不符 ⇒ 全部重导成原生拷贝
+        let rep3 = export_folder_zips(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep3.notes_reexported, 1, "格式标识变了必须重导，不能复用");
+        let names3 = zip_names(&pkg);
+        assert!(names3.contains(&"index.html".to_string()), "{names3:?}");
+        assert!(!names3.contains(&crate::md::NOTE_MD.to_string()), "{names3:?}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 源正文为空（为知里有 36/37 B 的空页）时：**仍然落地**、包内 note.md 为空、
+    /// 统计如实报 `empty_md`（不报错、不静默跳过）
+    #[test]
+    fn test_md_package_empty_source_still_lands() {
+        let d = std::env::temp_dir().join(format!("wiz-export-md-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let notes_dir = d.join("data").join("notes");
+        let guid = "22222222-3333-4444-5555-666666666666";
+        make_source_note(&notes_dir, guid, "<html><body><div><br></div></body></html>", &[]);
+        let index_db = d.join("index.db");
+        let src_size = std::fs::metadata(notes_dir.join(format!("{{{guid}}}"))).unwrap().len() as i64;
+        make_source_index(&index_db, guid, src_size);
+
+        let ctx = ExportContext::new(notes_dir.clone(), index_db);
+        let dest = d.join("lib");
+        let rep = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(rep.report.notes_exported, 1);
+        assert!(rep.report.skipped.is_empty(), "{:?}", rep.report.skipped);
+
+        let md_stats = rep.md.as_ref().unwrap();
+        assert_eq!(md_stats.empty_md, 1, "空正文要能被统计报出来");
+        assert_eq!(md_stats.empty_samples.len(), 1);
+
+        let mconn = manifest::open_and_migrate(&dest).unwrap();
+        let row = manifest::load_notes(&mconn).unwrap();
+        let pkg = dest.join(&row.get(guid).unwrap().exported_path);
+        assert!(pkg.is_file(), "空正文也要有包（清单行不能指向不存在的文件）");
+        assert!(zip_bytes(&pkg, crate::md::NOTE_MD).is_some(), "包内必须有 note.md 条目");
+        assert_eq!(zip_bytes(&pkg, crate::md::NOTE_MD).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M3：从 **md 包**单篇导出为原生 zip —— 包里只能有**一个**正文条目 `index.html`。
+    ///
+    /// 这里是回归闸门：导出物恒为原生形态（D0），故正文条目必是 `index.html`；
+    /// 而源包的正文条目名随库内形态而变（md 包是 `note.md`）。若照抄"跳过 index.html"的老逻辑，
+    /// md 库导出的包里会同时躺着新渲染的 `index.html` 与搬运来的 `note.md`（两份正文）。
+    #[test]
+    fn test_export_note_zip_from_md_package_has_single_body() {
+        let d = std::env::temp_dir().join(format!("wiz-export-mdzip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let notes_dir = d.join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        let guid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        // md 包：note.md（无 BOM）+ index_files 两条
+        {
+            let f = std::fs::File::create(notes_dir.join(format!("{{{guid}}}"))).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opt = SimpleFileOptions::default();
+            zw.start_file(crate::md::NOTE_MD, opt).unwrap();
+            zw.write_all("# 标题\n\n正文 bodytext\n".as_bytes()).unwrap();
+            zw.start_file("index_files/a.css", opt).unwrap();
+            zw.write_all(b".x{color:red}").unwrap();
+            zw.start_file("index_files/pic.png", opt).unwrap();
+            zw.write_all(b"PNGDATA").unwrap();
+            let mut out = zw.finish().unwrap();
+            out.flush().unwrap();
+        }
+        // 前置断言：这确实是个 md 包
+        let zip_svc = ZipService::new(notes_dir.clone());
+        assert_eq!(zip_svc.body_format(guid), crate::zipserve::BodyFormat::Md);
+
+        let index_db = d.join("index.db");
+        make_source_index(&index_db, guid, 0);
+        let ctx = ExportContext::new(notes_dir.clone(), index_db);
+        let dest = d.join("out.zip");
+        let rep = export_note_zip(&ctx, &zip_svc, guid, &[], &dest).unwrap();
+        assert_eq!(rep.notes_exported, 1);
+        assert!(rep.skipped.is_empty(), "{:?}", rep.skipped);
+
+        let names = zip_names(&dest);
+        assert_eq!(
+            names.iter().filter(|n| n.as_str() == "index.html").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&crate::md::NOTE_MD.to_string()),
+            "md 正文条目不得被搬运进导出包（会出现两份正文）: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "index_files/a.css"), "{names:?}");
+        assert!(names.iter().any(|n| n == "index_files/pic.png"), "{names:?}");
+        // 导出物是**原生**形态：正文 HTML 即 md 的渲染结果
+        let html = String::from_utf8(zip_bytes(&dest, "index.html").unwrap()).unwrap();
+        assert!(html.contains("正文 bodytext"), "md 库的单篇导出物正文应是 md 的渲染结果: {html}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M3：**转换器版本闸门** —— 版本变了必须全量重导，否则"改进转换器"这件事
+    /// 永远落不进已建好的 md 库（源没变、清单没变 ⇒ 一律判定可复用）。
+    #[test]
+    fn test_md_converter_version_forces_reexport() {
+        let d = std::env::temp_dir().join(format!("wiz-export-conv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let notes_dir = d.join("data").join("notes");
+        let guid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+        make_source_note(&notes_dir, guid, "<html><body><div>正文 text</div></body></html>", &[]);
+        let index_db = d.join("index.db");
+        let src_size = std::fs::metadata(notes_dir.join(format!("{{{guid}}}"))).unwrap().len() as i64;
+        make_source_index(&index_db, guid, src_size);
+        let ctx = ExportContext::new(notes_dir.clone(), index_db);
+        let dest = d.join("lib");
+
+        // ① 首次：新增 1 篇，meta 记下当前转换器版本
+        let r1 = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!((r1.notes_added, r1.notes_reused), (1, 0));
+        let mconn = manifest::open_and_migrate(&dest).unwrap();
+        assert_eq!(
+            manifest::get_meta(&mconn, MD_CONVERTER_META).unwrap().as_deref(),
+            Some(crate::md::CONVERTER_VERSION)
+        );
+        drop(mconn);
+
+        // ② 二次：源与清单都没变 → 全部复用（0 重导）
+        let r2 = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!((r2.notes_added, r2.notes_reexported, r2.notes_reused), (0, 0, 1));
+
+        // ③ 伪造成"上一版转换器建的库" → 必须全量重导，并在报告里说明原因
+        let mconn = manifest::open_and_migrate(&dest).unwrap();
+        manifest::set_meta(&mconn, MD_CONVERTER_META, "1").unwrap();
+        drop(mconn);
+        let r3 = export_folder_zips_md(&ctx, "", &dest, &|_, _| {}).unwrap();
+        assert_eq!(
+            (r3.notes_added, r3.notes_reexported, r3.notes_reused),
+            (0, 1, 0),
+            "转换器版本变更必须重导: {:?}",
+            r3.manifest_warnings
+        );
+        assert!(
+            r3.manifest_warnings.iter().any(|w| w.contains("转换器版本变更")),
+            "{:?}",
+            r3.manifest_warnings
+        );
+
+        // ④ native 形态不受该闸门影响（字节拷贝与转换器无关），且会把 meta 清空
+        let dest2 = d.join("lib-native");
+        std::fs::create_dir_all(&dest2).unwrap();
+        let mconn = manifest::open_and_migrate(&dest2).unwrap();
+        manifest::set_meta(&mconn, MD_CONVERTER_META, "1").unwrap();
+        drop(mconn);
+        let r4 = export_folder_zips(&ctx, "", &dest2, &|_, _| {}).unwrap();
+        assert_eq!((r4.notes_added, r4.notes_reused), (1, 0));
+        let r5 = export_folder_zips(&ctx, "", &dest2, &|_, _| {}).unwrap();
+        assert_eq!((r5.notes_reexported, r5.notes_reused), (0, 1), "native 二次跑仍应复用");
+        let mconn = manifest::open_readonly(&dest2).unwrap();
+        assert_eq!(manifest::get_meta(&mconn, MD_CONVERTER_META).unwrap().as_deref(), Some(""));
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
