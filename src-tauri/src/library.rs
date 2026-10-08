@@ -665,7 +665,14 @@ fn tmp_path_of(path: &Path) -> PathBuf {
 ///
 /// 返回重写后的字节数。
 pub fn rewrite_note_zip(path: &Path, replacements: &[(String, Vec<u8>)]) -> Result<u64, String> {
-    rewrite_note_zip_with(path, replacements, false)
+    rewrite_note_zip_with(path, replacements, &[], false)
+}
+
+/// **zip 原子追加器**：在不动任何既有条目的前提下**新增**条目（M4 图片插入用）。
+/// 同名条目已存在 → `ENTRY_EXISTS`（追加永不覆盖 —— 覆盖要走 `rewrite_note_zip`）。
+/// 原子性纪律与 [`rewrite_note_zip`] 完全同源（tmp → fsync → rename，失败删 tmp）。
+pub fn append_note_zip(path: &Path, additions: &[(String, Vec<u8>)]) -> Result<u64, String> {
+    rewrite_note_zip_with(path, &[], additions, false)
 }
 
 /// `abort_before_rename` 仅测试用（T9 崩溃注入）：模拟"tmp 已写完、rename 之前进程死掉"，
@@ -673,6 +680,7 @@ pub fn rewrite_note_zip(path: &Path, replacements: &[(String, Vec<u8>)]) -> Resu
 fn rewrite_note_zip_with(
     path: &Path,
     replacements: &[(String, Vec<u8>)],
+    additions: &[(String, Vec<u8>)],
     abort_before_rename: bool,
 ) -> Result<u64, String> {
     if !path.is_file() {
@@ -689,6 +697,9 @@ fn rewrite_note_zip_with(
         for i in 0..ar.len() {
             let entry = ar.by_index(i).map_err(|e| format!("读 zip 条目 {i} 失败: {e}"))?;
             let name = entry.name().to_string();
+            if additions.iter().any(|(n, _)| n == &name) {
+                return Err(format!("ENTRY_EXISTS: zip 内已有同名条目 {name}（追加不覆盖）"));
+            }
             match replacements.iter().find(|(n, _)| n == &name) {
                 Some((_, bytes)) => {
                     let opt = zip::write::SimpleFileOptions::default()
@@ -708,6 +719,12 @@ fn rewrite_note_zip_with(
                 "ENTRY_NOT_FOUND: zip 内缺少待替换条目（命中 {replaced}/{}）",
                 replacements.len()
             ));
+        }
+        for (name, bytes) in additions {
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(name.clone(), opt).map_err(|e| e.to_string())?;
+            zw.write_all(bytes).map_err(|e| e.to_string())?;
         }
         let mut out = zw.finish().map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
@@ -1127,6 +1144,314 @@ pub fn save_note_md(
         Some(crate::zipserve::BodyFormat::Md),
         md,
     )
+}
+
+// ---- M4 图片插入（把图片写进笔记包 index_files/，正文用相对路径引用） ----
+
+/// 写操作类型标识：往包内追加图片条目
+pub const OP_ADD_IMAGE: &str = "add-image";
+
+/// 单张图片上限（截图/照片都够用；再大的素材应该走附件，不该塞进正文包）
+pub const IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// [`add_note_image`] 的结果：`entry` 就是写进正文的那串相对引用
+/// （md 写 `![alt](entry)`、html 写 `<img src="entry">`），其余字段与
+/// [`NoteWriteReport`] 同口径 —— 命令层直接展开给 UI 用。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NoteImageReport {
+    /// 包内新条目（如 `index_files/截图_1a2b3c4d.png`）
+    pub entry: String,
+    /// true = 包内已有同内容条目，本次**零写入**复用（同一张图粘贴两次不重写包）
+    pub reused: bool,
+    pub op: String,
+    pub guid: String,
+    pub exported_path: String,
+    pub exported_size: i64,
+    pub exported_md5: String,
+    pub data_modified: String,
+    pub revision: i64,
+    pub manifest_revision: u64,
+    pub index_updated: bool,
+    pub warnings: Vec<String>,
+}
+
+/// 按魔数嗅探图片类型 → 扩展名。**不信任前端传的扩展名**（剪贴板里的图常没有名字）。
+/// 判不出来 → `NOT_IMAGE`（宁拒勿收：塞进包里渲染不出来的文件没有意义）。
+fn sniff_image_ext(bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Ok("png");
+    }
+    if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
+        return Ok("jpg");
+    }
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return Ok("gif");
+    }
+    // RIFF....WEBP
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok("webp");
+    }
+    if bytes.len() >= 2 && &bytes[..2] == b"BM" {
+        return Ok("bmp");
+    }
+    // SVG 是文本：允许 XML 声明/空白在前，必须含 `<svg`
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+    let trimmed = head.trim_start();
+    if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") {
+        if head.contains("<svg") {
+            return Ok("svg");
+        }
+    }
+    Err(format!(
+        "NOT_IMAGE: 无法识别的图片格式（前 {} 字节）——只支持 png/jpg/gif/webp/bmp/svg",
+        bytes.len().min(16)
+    ))
+}
+
+/// 建议文件名 → 安全 stem：剔路径与非法字符、截短、兜底 `fallback`。
+/// 内容 hash 由调用方另拼 —— 用户名只影响可读性，唯一性由 hash 保证。
+/// 白名单刻意**不含空格与括号**：md 引用 `![](index_files/…)` 里它们要么断语法
+/// 要么得转义，与其在两处前端做转义，不如源头就不放行（中文/字母数字不受影响）。
+fn entry_stem(suggested: Option<&str>, fallback: &str) -> String {
+    let raw = suggested.unwrap_or("");
+    let stem = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let stem = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+    let mut out = String::new();
+    for c in stem.chars() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+        if out.chars().count() >= 40 {
+            break;
+        }
+    }
+    let out = out.trim().trim_end_matches('.').to_string();
+    // 全是替身 `_`（原名全是非法字符，如纯空格）也算没名字
+    if out.is_empty() || out.chars().all(|c| c == '_') {
+        fallback.to_string()
+    } else {
+        out
+    }
+}
+
+/// 附件扩展名：取自文件名末段，只留 ASCII 字母数字并小写、截短 12、兜底 `bin`。
+/// 条目名要进 md 链接 `[](attachments/…)`，与 stem 同一红线：不放空格/括号。
+/// 不做格式白名单（最小版类型不限），扩展名只影响可读性与系统打开方式。
+fn attachment_ext(suggested: Option<&str>) -> String {
+    let raw = suggested.unwrap_or("");
+    let ext = raw.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let mut out = String::new();
+    for c in ext.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        }
+        if out.chars().count() >= 12 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        "bin".to_string()
+    } else {
+        out
+    }
+}
+
+/// 读 zip 内全部条目名（追加前查重用）
+fn zip_entry_names(path: &Path) -> Result<Vec<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let ar = zip::ZipArchive::new(f).map_err(|e| format!("打开 zip 失败: {e}"))?;
+    Ok(ar.file_names().map(|s| s.to_string()).collect())
+}
+
+/// 把一张图片写入笔记包（M4）：校验类型与大小 → 追加 `index_files/` 条目 →
+/// 清单事务 → 单篇索引增量。命名/去重/写三律见 [`add_note_package_entry`]。
+pub fn add_note_image(
+    library_dir: &Path,
+    index_db: &Path,
+    guid: &str,
+    bytes: &[u8],
+    suggested_name: Option<&str>,
+) -> Result<NoteImageReport, String> {
+    if bytes.is_empty() {
+        return Err("EMPTY_IMAGE: 图片内容为空".into());
+    }
+    if bytes.len() > IMAGE_MAX_BYTES {
+        return Err(format!(
+            "IMAGE_TOO_LARGE: 图片 {} MB 超过上限 {} MB",
+            bytes.len() / 1024 / 1024,
+            IMAGE_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let ext = sniff_image_ext(bytes)?;
+    add_note_package_entry(
+        library_dir,
+        index_db,
+        guid,
+        bytes,
+        suggested_name,
+        "image",
+        "index_files",
+        ext,
+        OP_ADD_IMAGE,
+    )
+}
+
+/// 附件条目上限（M4 最小版：类型不限、全进包；再大的素材应走分档策略落库根
+/// `_attachments/`，与包解耦 —— 避免改一个字就整包重写/重传）。
+pub const ATTACHMENT_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+/// 写操作类型标识：往包内追加通用附件条目
+pub const OP_ADD_ATTACHMENT: &str = "add-attachment";
+
+/// 把任意文件作为附件写入笔记包（M4 最小版）：不做格式判定（docx/视频/压缩包
+/// 都收），扩展名取自文件名（净化、兜底 `bin`），条目落 `attachments/`。
+/// 命名/去重/写三律与 [`add_note_image`] 完全同源 —— 见 [`add_note_package_entry`]。
+/// 正文引用由前端拼：md `[名](entry)`、html `<a href="entry">`（附件不能内联渲染）。
+pub fn add_note_attachment(
+    library_dir: &Path,
+    index_db: &Path,
+    guid: &str,
+    bytes: &[u8],
+    suggested_name: Option<&str>,
+) -> Result<NoteImageReport, String> {
+    if bytes.is_empty() {
+        return Err("EMPTY_ATTACHMENT: 附件内容为空".into());
+    }
+    if bytes.len() > ATTACHMENT_MAX_BYTES {
+        return Err(format!(
+            "ATTACHMENT_TOO_LARGE: 附件 {} MB 超过上限 {} MB",
+            bytes.len() / 1024 / 1024,
+            ATTACHMENT_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let ext = attachment_ext(suggested_name);
+    add_note_package_entry(
+        library_dir,
+        index_db,
+        guid,
+        bytes,
+        suggested_name,
+        "attachment",
+        "attachments",
+        &ext,
+        OP_ADD_ATTACHMENT,
+    )
+}
+
+/// 图片与附件共用的入包实现。调用方负责空/超限/格式校验并定 `ext`
+/// （图片按魔数嗅探、附件取自文件名）；这里统一负责：
+/// 命名 `{dir}/{净化stem}_{内容md5前8位}.{ext}` —— 内容 hash 保证唯一与去重：
+/// 同内容再次插入**零写入**复用（`reused=true`），不同内容绝不撞名；
+/// 原子追加（tmp+fsync+rename、既有条目整包搬运）→ 清单事务（md5/体积/脏闩，
+/// 与 [`write_note_body`] 同一实现）→ 单篇索引增量 —— 与正文写同一套写三律。
+fn add_note_package_entry(
+    library_dir: &Path,
+    index_db: &Path,
+    guid: &str,
+    bytes: &[u8],
+    suggested_name: Option<&str>,
+    fallback_stem: &str,
+    dir: &str,
+    ext: &str,
+    op: &str,
+) -> Result<NoteImageReport, String> {
+    let guid = norm_guid(guid)?;
+    let _guard = acquire_write_lock(library_dir)?;
+    let conn = open_manifest_rw(library_dir)?;
+    let row = load_note_row(&conn, &guid)?;
+    if is_unsafe_rel_path(&row.exported_path) {
+        return Err(format!("PATH_UNSAFE: {}", row.exported_path));
+    }
+    let dest = library_dir.join(&row.exported_path);
+    if !dest.is_file() {
+        return Err(format!("NOTE_PACKAGE_MISSING: 库内缺文件 {}", row.exported_path));
+    }
+
+    // 定名：stem_{md5-8}.{ext}。去重按**内容 hash**（不看 stem）：同一张图不管贴几次、
+    // 当年叫什么名字，都复用既有条目、零写入；hash8 撞了但内容不同（16^8 空间，纯防御）
+    // 才换序号另存。
+    use md5::{Digest, Md5};
+    let hash = format!("{:x}", Md5::digest(bytes));
+    let hash8: String = hash.chars().take(8).collect();
+    let stem = entry_stem(suggested_name, fallback_stem);
+    let names = zip_entry_names(&dest)?;
+    let suffix = format!("_{hash8}.{ext}");
+    let mut entry = format!("{dir}/{stem}{suffix}");
+    let mut reused = false;
+    if let Some(existing) = names
+        .iter()
+        .find(|n| n.starts_with(dir) && n.ends_with(&suffix))
+    {
+        match read_zip_entry(&dest, existing)? {
+            Some(prev) if prev == bytes => {
+                entry = existing.clone();
+                reused = true;
+            }
+            _ => {
+                let mut i = 2;
+                loop {
+                    entry = format!("{dir}/{stem}_{hash8}_{i}.{ext}");
+                    if !names.iter().any(|n| n == &entry) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    let (size, md5, warnings) = if reused {
+        // 零写入：包与清单都不动，只把既有条目名报回去
+        (row.exported_size, row.exported_md5.clone(), Vec::new())
+    } else {
+        // ① 落盘（原子 rename，只追加、整包搬运）→ ② 清单事务 → ③ 单篇索引
+        append_note_zip(&dest, &[(entry.clone(), bytes.to_vec())])?;
+        let size = std::fs::metadata(&dest).map_err(|e| e.to_string())?.len() as i64;
+        let md5 = manifest::md5_file(&dest)?;
+        let patch = NoteRowPatch {
+            title: row.title.clone(),
+            location: row.location.clone(),
+            exported_path: row.exported_path.clone(),
+            exported_size: size,
+            exported_md5: md5.clone(),
+            exported_at: file_mtime_utc(&dest),
+        };
+        let c = commit_note_write(&conn, &guid, &patch)?;
+        let mut warnings = manifest::check_invariants(&conn, library_dir)?;
+        let (index_updated, iw) = refresh_one_index(library_dir, index_db, &guid);
+        warnings.extend(iw);
+        return Ok(NoteImageReport {
+            entry,
+            reused: false,
+            op: op.into(),
+            guid,
+            exported_path: patch.exported_path,
+            exported_size: size,
+            exported_md5: md5,
+            data_modified: c.data_modified,
+            revision: c.row_revision,
+            manifest_revision: c.manifest_revision,
+            index_updated,
+            warnings,
+        });
+    };
+
+    Ok(NoteImageReport {
+        entry,
+        reused,
+        op: op.into(),
+        guid,
+        exported_path: row.exported_path.clone(),
+        exported_size: size,
+        exported_md5: md5,
+        data_modified: row.data_modified.clone(),
+        revision: row.revision,
+        manifest_revision: 0,
+        index_updated: true,
+        warnings,
+    })
 }
 
 /// 重命名标题（§4.3/T6）：落地文件名随标题变，`exported_path` 同步更新；
@@ -1671,9 +1996,66 @@ pub fn create_note(
     })
 }
 
+/// 空库初始化：目录判为 `empty`（无清单）时，建一份当前 schema 的空清单
+/// （export.db）并**同步重建派生索引**。
+///
+/// 为什么必须重建索引：派生索引文件在 `~/.wizreader/`（库根之外），用户清空库根
+/// 时它会幸存且仍是旧内容 —— 只建清单不重建索引，树/列表会立刻读出已删笔记的
+/// 陈旧行（点开报「笔记包不存在」，重启后启动自检又把行清掉，症状「复活又消失」）。
+/// 空库重建为 O(1)；`index_db` 由调用方给出（命令层传 `index_file_for_library`，
+/// 测试传临时路径以避免 WIZREADER_HOME 并行污染）。
+pub fn init_empty_library_manifest(lib: &Path, index_db: &Path) -> Result<(), String> {
+    let status = validate_library(lib);
+    if status.kind != "empty" {
+        return Err(format!(
+            "LIBRARY_NOT_EMPTY: 目录不是空目录（{}），缺清单时应先 manifest-rebuild 重建清单",
+            status.kind
+        ));
+    }
+    // 建空清单（返回的连接语句结束即释放，不阻塞后面的 mode=ro 打开）
+    manifest::open_and_migrate(lib)?;
+    let resolver = std::sync::Arc::new(LibraryResolver::new(lib.to_path_buf())?);
+    crate::indexer::build_library_index(lib, resolver, index_db, &|_, _| {})?;
+    Ok(())
+}
+
 /// 生成新笔记 guid：uuid v4 小写连字符形（清单内 guid 统一无花括号，见 [`norm_guid`]）。
 fn new_note_guid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 新建目录（库内）：路径校验 → 磁盘 `create_dir_all` → 索引 folder 表补行（含父链）。
+///
+/// 目录**不进清单**（清单只记笔记与附件；目录 = 笔记 location 推导 + 磁盘实况补充），
+/// 故不持写锁、不置脏 —— 空目录在索引重建时由磁盘扫描保留（见
+/// `indexer::collect_disk_dirs`）。索引不存在/写失败不算致命：目录已在磁盘上，
+/// 下次「重建索引」会把它扫回树里。返回规范化后的 location（`/a/b/` 形态）。
+pub fn create_folder(library_dir: &Path, index_db: &Path, path: &str) -> Result<String, String> {
+    let loc = norm_location(path)?;
+    if loc == "/" {
+        return Err("PATH_UNSAFE: 目录名不能为空".into());
+    }
+    // 保留区/隐藏名拒绝：`_` 前缀是系统保留目录（_trash/_attachments 等），
+    // `.` 前缀是隐藏目录；空段（来自 `//`）同样是坏路径
+    for seg in loc.trim_matches('/').split('/') {
+        if seg.is_empty() || seg.starts_with('_') || seg.starts_with('.') {
+            return Err(format!("PATH_UNSAFE: 保留/隐藏名不可用作目录：`{seg}`"));
+        }
+    }
+    let abs = library_dir.join(loc.trim_matches('/'));
+    std::fs::create_dir_all(&abs).map_err(|e| format!("CREATE_DIR_FAILED: 无法创建目录（{e}）"))?;
+    // 索引补行让目录立即可见（无索引时跳过 —— 重建索引会从磁盘扫出）
+    if index_db.is_file() {
+        match Connection::open(index_db) {
+            Ok(conn) => {
+                if let Err(e) = crate::indexer::ensure_folders(&conn, &loc) {
+                    return Err(format!("目录已建，但写入索引失败（可重建索引修复）: {e}"));
+                }
+            }
+            Err(e) => return Err(format!("目录已建，但打开索引失败（可重建索引修复）: {e}")),
+        }
+    }
+    Ok(loc)
 }
 
 /// 写一个全新的 md 包：单条目 `note.md`（UTF-8 无 BOM，Deflated）。
@@ -2055,6 +2437,58 @@ mod tests {
         (d, index_db, g1, g2)
     }
 
+    #[test]
+    fn init_empty_library_manifest_rebuilds_stale_index() {
+        // 回归「复活又消失」bug：库有 2 篇笔记 + 派生索引；用户清空库根（清单+zip 全删）
+        // → 索引幸存于库根之外仍是旧内容 → 空库初始化必须把索引一并清成 0 行，
+        //   否则树/列表立刻读出已删笔记，点开报「笔记包不存在」
+        let (d, _idx_in_lib, _g1, _g2) = mk_writable_lib("init_empty_regress");
+        // 把派生索引建到「库根之外」的路径（模拟 ~/.wizreader/index-{hash8}.db）
+        let out_idx = temp_dir("init_empty_regress_out").join("index-out.db");
+        let resolver = std::sync::Arc::new(LibraryResolver::new(d.clone()).unwrap());
+        crate::indexer::build_library_index(&d, resolver, &out_idx, &|_, _| {}).unwrap();
+        // 清空库根：清单 + 笔记 zip（derived.db 是 helper 建在库内的，一并删）
+        std::fs::remove_file(manifest::manifest_path(&d)).unwrap();
+        std::fs::remove_dir_all(d.join("工作")).unwrap();
+        std::fs::remove_file(d.join("derived.db")).unwrap();
+        // bug 现场：索引仍是旧的 2 行，而库根已空
+        {
+            let c = Connection::open(&out_idx).unwrap();
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM note", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
+        // 空库初始化：清单重建为空 + 索引同步清零
+        init_empty_library_manifest(&d, &out_idx).unwrap();
+        assert!(manifest::manifest_path(&d).is_file());
+        let m = Connection::open(manifest::manifest_path(&d)).unwrap();
+        assert_eq!(
+            m.query_row("SELECT count(*) FROM note", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let c = Connection::open(&out_idx).unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM note", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn init_empty_library_manifest_refuses_no_manifest_dir() {
+        // 有 zip 无清单 = no_manifest：绝不凭空造清单（zip 会变孤儿），必须 manifest-rebuild
+        let d = temp_dir("init_empty_refuse");
+        std::fs::create_dir_all(d.join("工作")).unwrap();
+        write_md_zip_file(&d.join("工作/笔记.zip"), "# 笔记\n\n", false);
+        let out_idx = temp_dir("init_empty_refuse_out").join("index-out.db");
+        let err = init_empty_library_manifest(&d, &out_idx).unwrap_err();
+        assert!(err.contains("LIBRARY_NOT_EMPTY"), "实际: {err}");
+        assert!(!manifest::manifest_path(&d).is_file());
+    }
+
     fn fts_hits(index_db: &Path, kw: &str) -> i64 {        let conn = Connection::open(index_db).unwrap();
         conn.query_row(
             "SELECT count(*) FROM note_fts WHERE note_fts MATCH ?1",
@@ -2105,6 +2539,7 @@ mod tests {
         let err = rewrite_note_zip_with(
             &zp,
             &[("index.html".to_string(), b"ABORTED".to_vec())],
+            &[],
             true,
         )
         .unwrap_err();
@@ -2852,6 +3287,261 @@ mod tests {
         assert_eq!(std::fs::read(&zp).unwrap(), before, "失败路径不得改动 zip");
         assert!(!tmp_path_of(&zp).exists(), "失败路径应清掉 tmp");
         std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    // ---------------------------------------------------------------- M4：图片插入（index_files/ 追加）
+
+    fn png_bytes(tag: u8) -> Vec<u8> {
+        let mut v = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(format!("image-payload-{tag}").as_bytes());
+        v
+    }
+
+    fn content_hash8(bytes: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::digest(bytes)).chars().take(8).collect()
+    }
+
+    /// 图片 stem 的测试助手（生产代码已直接用 `entry_stem`，图片版只活在测试里）
+    fn image_entry_stem(suggested: Option<&str>) -> String {
+        entry_stem(suggested, "image")
+    }
+
+    /// M4 核心路径：入包 → `index_files/` 新条目 + 清单事务（md5/体积/行 rev）+ 脏闩 + 索引增量
+    #[test]
+    fn test_add_note_image_md_package_and_manifest() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addimg");
+        let zp = lib.join("工作/笔记一.zip");
+        let names_before = zip_entry_names(&zp);
+        let bytes = png_bytes(1);
+
+        let rep = add_note_image(&lib, &index_db, &g1, &bytes, Some("我的 截图.png")).unwrap();
+        assert_eq!(
+            rep.entry,
+            format!("index_files/我的_截图_{}.png", content_hash8(&bytes)),
+            "stem 净化（空格→_）、扩展名按魔数、唯一性靠内容 hash"
+        );
+        assert!(!rep.reused);
+        // 条目真的在包里、字节一致；既有条目一个不少（整包搬运）
+        assert_eq!(zip_entry(&zp, &rep.entry), bytes);
+        let names_after = zip_entry_names(&zp);
+        for n in &names_before {
+            assert!(names_after.contains(n), "既有条目不得丢失: {n}");
+        }
+        assert_eq!(names_after.len(), names_before.len() + 1);
+        // 清单事务：md5/体积与磁盘一致；行 rev 0 → 1；**不铸版**（v6）
+        assert_eq!(rep.exported_md5, manifest::md5_file(&zp).unwrap());
+        assert_eq!(rep.exported_size, std::fs::metadata(&zp).unwrap().len() as i64);
+        assert_eq!(rep.revision, 1);
+        assert_eq!(rep.manifest_revision, 0, "库内写不铸版");
+        assert!(rep.index_updated, "{:?}", rep.warnings);
+        // 脏闩置位（写入必须进入下一次上行）
+        let conn = manifest::open_readonly(&lib).unwrap();
+        assert!(
+            manifest::load_unsynced_note_guids(&conn).unwrap().contains(&g1),
+            "插入图片后该篇必须置脏"
+        );
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 同一张图重复插入 → 零写入复用（包与清单都不动，只回既有条目名）
+    #[test]
+    fn test_add_note_image_dedup_reuses_existing_entry() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addimg-dup");
+        let zp = lib.join("工作/笔记一.zip");
+        let bytes = png_bytes(7);
+        let rep1 = add_note_image(&lib, &index_db, &g1, &bytes, Some("a.png")).unwrap();
+        let md5_after_first = manifest::md5_file(&zp).unwrap();
+
+        let rep2 = add_note_image(&lib, &index_db, &g1, &bytes, Some("换一个名字.png")).unwrap();
+        assert!(rep2.reused, "同内容必须去重复用");
+        assert_eq!(rep2.entry, rep1.entry, "去重复用返回同一条目名");
+        assert_eq!(manifest::md5_file(&zp).unwrap(), md5_after_first, "复用不得重写包");
+        assert_eq!(rep2.revision, rep1.revision, "复用不得 +revision");
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 非图片 / 超限 → 明确报错且**零写入**（包与清单都原封不动）
+    #[test]
+    fn test_add_note_image_rejects_non_image_and_oversize() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addimg-reject");
+        let zp = lib.join("工作/笔记一.zip");
+        let before = std::fs::read(&zp).unwrap();
+        let conn = manifest::open_readonly(&lib).unwrap();
+        let md5_before: String = conn
+            .query_row("SELECT exported_md5 FROM note WHERE guid=?1", [g1.clone()], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        let err = add_note_image(&lib, &index_db, &g1, b"plain text, not an image", None).unwrap_err();
+        assert!(err.starts_with("NOT_IMAGE"), "{err}");
+        let oversize = vec![0u8; IMAGE_MAX_BYTES + 1];
+        let err = add_note_image(&lib, &index_db, &g1, &oversize, None).unwrap_err();
+        assert!(err.starts_with("IMAGE_TOO_LARGE"), "{err}");
+        let empty: Vec<u8> = Vec::new();
+        assert!(add_note_image(&lib, &index_db, &g1, &empty, None)
+            .unwrap_err()
+            .starts_with("EMPTY_IMAGE"));
+
+        assert_eq!(std::fs::read(&zp).unwrap(), before, "被拒的写不得触碰 zip");
+        let conn = manifest::open_readonly(&lib).unwrap();
+        let md5_after: String = conn
+            .query_row("SELECT exported_md5 FROM note WHERE guid=?1", [g1], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(md5_after, md5_before, "被拒的写不得改清单");
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// native（html）包同样可插图 —— index_files/ 与包正文形态无关，zipserve 都能解析
+    #[test]
+    fn test_add_note_image_native_package() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_lib("addimg-native");
+        let zp = lib.join("工作/笔记一.zip");
+        let bytes = png_bytes(2);
+        let rep = add_note_image(&lib, &index_db, &g1, &bytes, None).unwrap();
+        assert!(rep.entry.starts_with("index_files/image_"), "无名字兜底 image: {}", rep.entry);
+        assert_eq!(zip_entry(&zp, &rep.entry), bytes);
+        assert_eq!(rep.exported_md5, manifest::md5_file(&zp).unwrap());
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 写锁被同步占用 → LOCK_BUSY 且零写入（与正文写同一把锁）
+    #[test]
+    fn test_add_note_image_lock_busy() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addimg-lock");
+        let zp = lib.join("工作/笔记一.zip");
+        let guard = crate::sync::try_acquire(&lib).unwrap();
+        assert!(guard.is_some());
+        let err = add_note_image(&lib, &index_db, &g1, &png_bytes(3), None).unwrap_err();
+        assert!(err.contains("LOCK_BUSY"), "{err}");
+        drop(guard);
+        let names_before = zip_entry_names(&zp);
+        assert!(add_note_image(&lib, &index_db, &g1, &png_bytes(3), None).is_ok(), "锁释放后可写");
+        assert_eq!(zip_entry_names(&zp).len(), names_before.len() + 1);
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// stem 净化：剔路径、剔非法字符、截短、兜底（唯一性由内容 hash 保证，名字只管可读）
+    #[test]
+    fn test_image_entry_stem_sanitize() {
+        assert_eq!(image_entry_stem(Some("我的 截图.png")), "我的_截图");
+        assert_eq!(image_entry_stem(Some("/etc/passwd.jpg")), "passwd");
+        assert_eq!(image_entry_stem(Some("a b(1).png")), "a_b_1_");
+        assert_eq!(image_entry_stem(None), "image");
+        assert_eq!(image_entry_stem(Some("   ")), "image");
+        assert_eq!(image_entry_stem(Some(&"长".repeat(60))).chars().count(), 40);
+    }
+
+    // ---------------------------------------------------------------- M4：附件插入（attachments/ 追加）
+
+    fn fake_docx(tag: u8) -> Vec<u8> {
+        let mut v = b"PK\x03\x04".to_vec();
+        v.extend_from_slice(format!("attachment-payload-{tag}").as_bytes());
+        v
+    }
+
+    /// 附件入包核心路径：`attachments/` 新条目 + 清单事务 + 脏闩 + 索引增量；
+    /// 扩展名取自文件名（净化小写）、stem 兜底 `attachment`
+    #[test]
+    fn test_add_note_attachment_md_package() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addatt");
+        let zp = lib.join("工作/笔记一.zip");
+        let names_before = zip_entry_names(&zp);
+        let bytes = fake_docx(1);
+
+        let rep = add_note_attachment(&lib, &index_db, &g1, &bytes, Some("季度报告 v2.DOCX")).unwrap();
+        assert_eq!(
+            rep.entry,
+            format!("attachments/季度报告_v2_{}.docx", content_hash8(&bytes)),
+            "stem 净化（空格→_）、扩展名取自文件名并小写、唯一性靠内容 hash"
+        );
+        assert!(!rep.reused);
+        assert_eq!(zip_entry(&zp, &rep.entry), bytes, "条目字节一致");
+        let names_after = zip_entry_names(&zp);
+        for n in &names_before {
+            assert!(names_after.contains(n), "既有条目不得丢失: {n}");
+        }
+        assert_eq!(names_after.len(), names_before.len() + 1);
+        assert_eq!(rep.exported_md5, manifest::md5_file(&zp).unwrap());
+        assert_eq!(rep.exported_size, std::fs::metadata(&zp).unwrap().len() as i64);
+        assert_eq!(rep.revision, 1);
+        assert_eq!(rep.manifest_revision, 0, "库内写不铸版");
+        assert!(rep.index_updated, "{:?}", rep.warnings);
+        assert_eq!(rep.op, OP_ADD_ATTACHMENT);
+        let conn = manifest::open_readonly(&lib).unwrap();
+        assert!(
+            manifest::load_unsynced_note_guids(&conn).unwrap().contains(&g1),
+            "插入附件后该篇必须置脏"
+        );
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 同内容不同文件名 → 去重复用零写入；超限/空 → 明确报错且零写入
+    #[test]
+    fn test_add_note_attachment_dedup_and_reject() {
+        let _s = write_test_lock();
+        let (lib, index_db, g1, _g2) = mk_writable_md_lib("addatt-dup");
+        let zp = lib.join("工作/笔记一.zip");
+        let bytes = fake_docx(7);
+        let rep1 = add_note_attachment(&lib, &index_db, &g1, &bytes, Some("a.docx")).unwrap();
+        let md5_after_first = manifest::md5_file(&zp).unwrap();
+
+        let rep2 =
+            add_note_attachment(&lib, &index_db, &g1, &bytes, Some("换一个名字.docx")).unwrap();
+        assert!(rep2.reused, "同内容必须去重复用（不看文件名）");
+        assert_eq!(rep2.entry, rep1.entry);
+        assert_eq!(manifest::md5_file(&zp).unwrap(), md5_after_first, "复用不得重写包");
+        assert_eq!(rep2.revision, rep1.revision, "复用不得 +revision");
+
+        // 无扩展名 → bin 兜底；无名字 → stem 兜底 attachment
+        let raw: &[u8] = b"just some bytes";
+        let rep3 = add_note_attachment(&lib, &index_db, &g1, raw, None).unwrap();
+        assert_eq!(
+            rep3.entry,
+            format!("attachments/attachment_{}.bin", content_hash8(raw)),
+            "stem/ext 双兜底"
+        );
+
+        let before = std::fs::read(&zp).unwrap();
+        let conn = manifest::open_readonly(&lib).unwrap();
+        let md5_before: String = conn
+            .query_row("SELECT exported_md5 FROM note WHERE guid=?1", [g1.clone()], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        let oversize = vec![0u8; ATTACHMENT_MAX_BYTES + 1];
+        let err = add_note_attachment(&lib, &index_db, &g1, &oversize, None).unwrap_err();
+        assert!(err.starts_with("ATTACHMENT_TOO_LARGE"), "{err}");
+        let empty: Vec<u8> = Vec::new();
+        assert!(add_note_attachment(&lib, &index_db, &g1, &empty, None)
+            .unwrap_err()
+            .starts_with("EMPTY_ATTACHMENT"));
+        assert_eq!(std::fs::read(&zp).unwrap(), before, "被拒的写不得触碰 zip");
+        let conn = manifest::open_readonly(&lib).unwrap();
+        let md5_after: String = conn
+            .query_row("SELECT exported_md5 FROM note WHERE guid=?1", [g1], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(md5_after, md5_before, "被拒的写不得改清单");
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 附件扩展名净化：小写、只留字母数字、截短、兜底 bin
+    #[test]
+    fn test_attachment_ext_sanitize() {
+        assert_eq!(attachment_ext(Some("报告 v2.DOCX")), "docx");
+        assert_eq!(attachment_ext(Some("movie.MP4")), "mp4");
+        assert_eq!(attachment_ext(Some("noext")), "bin");
+        assert_eq!(attachment_ext(Some("a.b..")), "bin", "末段全非字母数字 → 兜底 bin");
+        assert_eq!(attachment_ext(Some("x.mp 4!")), "mp4");
+        assert_eq!(attachment_ext(None), "bin");
+        assert_eq!(attachment_ext(Some("f.abcdefghijklmnopqrstuvwxyz")).len(), 12);
     }
 
     /// 校验两档（与 HTML 口径对齐）：空正文 / 宿主引用硬拒；`<script>` 与"无文本"只警告

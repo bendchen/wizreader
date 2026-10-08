@@ -721,6 +721,14 @@ pub fn build_library_index(
     for loc in &locations {
         ensure_folders(&dst, loc)?;
     }
+    // 磁盘实况目录也进树（空目录可见、库内「新建目录」跨重建保留）：
+    // 跳过保留区（`_` 前缀：_trash/_attachments/_conflicts/_unlinked_attachments）
+    // 与隐藏目录（`.` 前缀），只认目录。与清单推导行 INSERT OR IGNORE 共存。
+    let mut disk_locs: Vec<String> = Vec::new();
+    collect_disk_dirs(library_dir, library_dir, 0, &mut disk_locs)?;
+    for loc in &disk_locs {
+        ensure_folders(&dst, loc)?;
+    }
 
     // ---- 逐篇 note + fts（正文经 resolver 定位 zip）----
     let zip = ZipService::with_resolver(resolver.clone() as Arc<dyn NotePathResolver>);
@@ -905,7 +913,9 @@ fn note_body_text(zip: &ZipService, guid: &str) -> Result<(i64, String, String),
 
 /// 库模式 folder 由 `location` 推导（无 FOLDERS_POS → `pos=i64::MAX`，前端按名称序）。
 /// `INSERT OR IGNORE`：已存在的目录行（含将来可能恢复的真实排序权重）不被覆盖。
-fn ensure_folders(dst: &Connection, location: &str) -> Result<(), String> {
+/// 按 location 补齐 folder 表行（含全部祖先链，INSERT OR IGNORE 幂等）。
+/// 全量构建（清单 location + 磁盘实况目录）与库内「新建目录」增量共用。
+pub fn ensure_folders(dst: &Connection, location: &str) -> Result<(), String> {
     let mut acc = String::from("/");
     for seg in location.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
         acc = format!("{}{}/", acc, seg);
@@ -920,6 +930,38 @@ fn ensure_folders(dst: &Connection, location: &str) -> Result<(), String> {
             rusqlite::params![acc, name, parent, i64::MAX],
         )
         .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 递归收集库内磁盘目录（location 形态 `/a/b/`）：跳过 `_`/`.` 前缀目录
+/// （系统保留区/隐藏目录）。深度上限 16 兜底，防异常嵌套。
+fn collect_disk_dirs(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    if depth >= 16 {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('_') || name.starts_with('.') {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(format!("/{}/", rel.trim_matches('/')));
+        collect_disk_dirs(root, &p, depth + 1, out)?;
     }
     Ok(())
 }
@@ -1078,6 +1120,47 @@ pub fn update_library_note_index(
             Err(e)
         }
     }
+}
+
+/// 增量索引更新后清理 folder 残留行：删除「**无笔记 ∧ 磁盘无目录**」的行。
+///
+/// 全量重建天然无此残留（folder 表 = 笔记 location ∪ 磁盘目录，见
+/// `build_library_index`）；单篇增量走删除/改名路径会留下 —— `update_library_note_index`
+/// 有意保留 folder 行（那是 UI 删单篇的口径，目录树由其它篇目决定），而下行侧回收站
+/// 已把空目录从磁盘清掉（`prune_empty_dirs`），行必须跟着走，否则树里出现
+/// 「磁盘上不存在的空目录」。只删行、不建行：新增目录由 ensure_folders/全量重建负责。
+/// 路径形态 `/a/b/` ↔ `library_dir/a/b`。子目录在磁盘上 ⇒ 父目录必在，故删行天然叶安全。
+pub fn prune_stale_index_folders(index_db_path: &Path, library_dir: &Path) -> Result<(), String> {
+    let conn = Connection::open(index_db_path).map_err(|e| format!("打开派生索引失败: {e}"))?;
+    let paths: Vec<String> = {
+        let mut st = conn
+            .prepare("SELECT path FROM folder")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+    for p in paths {
+        let has_note: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM note WHERE location = ?1)",
+                [&p],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .map_err(|e| e.to_string())?;
+        if has_note {
+            continue;
+        }
+        let rel = p.trim_matches('/');
+        let on_disk = rel.is_empty() || library_dir.join(rel).is_dir();
+        if !on_disk {
+            conn.execute("DELETE FROM folder WHERE path = ?1", [&p])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

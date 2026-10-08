@@ -145,6 +145,13 @@ fn md5_hex(data: &[u8]) -> String {
 
 pub struct S3Store {
     bucket: s3::bucket::Bucket,
+    /// 真云方言适配（2026-09-20 Ceph RGW 实测，boto3 独立复核）：该实现把 `If-Match` 的值
+    /// 与**存储的不带引号 ETag** 做字面比较 ⇒ RFC 的带引号形式永远 412（连正确 ETag 也是），
+    /// 而**去引号形式语义完全正确**（错误 ETag 照样被拒）。false = 先按 RFC 引号形式发；
+    /// 一旦「引号 412 → 去引号重试成功」，置 true，此后直接发去引号形式，省一次往返。
+    /// 安全性：去引号重试**只在引号形式 412 之后**发生，且重试结果按原语义解释
+    /// （2xx=写入 / 其余=维持 412 判定），不吞掉任何一次真冲突。
+    if_match_unquoted: std::sync::atomic::AtomicBool,
 }
 
 impl S3Store {
@@ -190,7 +197,10 @@ impl S3Store {
             .map_err(|e| format!("连接构造失败: {e}"))?;
         // Bucket::new 返回 Box<Bucket>；with_path_style 消费 self 且同样返回 Box<Bucket>
         let bucket = if cfg.path_style { bucket.with_path_style() } else { bucket };
-        Ok(Self { bucket: *bucket })
+        Ok(Self {
+            bucket: *bucket,
+            if_match_unquoted: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
@@ -269,16 +279,62 @@ impl ObjectStore for S3Store {
         extra_meta: &[(String, String)],
     ) -> Result<ConditionalPut, String> {
         let hex = md5_hex(data);
+        // If-Match 方言（见 `if_match_unquoted` 字段注释）：已探测为「去引号」实现 ⇒ 直接发去引号值
+        let unquoted_mode = self
+            .if_match_unquoted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let adapted: Option<String> = match (&pre, unquoted_mode) {
+            (Precondition::Match(e), true) => Some(e.trim_matches('"').to_string()),
+            _ => None,
+        };
+        let pre_eff: Precondition<'_> = match (&adapted, &pre) {
+            (Some(u), _) => Precondition::Match(u.as_str()),
+            (None, Precondition::Match(e)) => Precondition::Match(*e),
+            (None, Precondition::Absent) => Precondition::Absent,
+        };
         let (status, rep) = self
             .put_stream_inner(
                 key,
                 &hex,
                 None,
-                Some(pre),
+                Some(pre_eff),
                 extra_meta,
                 Body::Bytes(data.to_vec()),
             )
             .await?;
+        // 引号形式吃了 412 ⇒ 试用「去引号」方言（一次）。重试结果按原语义解释：
+        // 2xx = 写入成功（并记住方言）；其余一律**维持第一次的 412 判定**（保守，不吞真冲突）。
+        let (status, rep) = if status == 412 && adapted.is_none() {
+            if let Precondition::Match(etag) = &pre {
+                let unq = etag.trim_matches('"');
+                if unq != *etag {
+                    match self
+                        .put_stream_inner(
+                            key,
+                            &hex,
+                            None,
+                            Some(Precondition::Match(unq)),
+                            extra_meta,
+                            Body::Bytes(data.to_vec()),
+                        )
+                        .await
+                    {
+                        Ok((s2, r2)) if (200..300).contains(&s2) => {
+                            self.if_match_unquoted
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            (s2, r2)
+                        }
+                        _ => (status, rep),
+                    }
+                } else {
+                    (status, rep)
+                }
+            } else {
+                (status, rep)
+            }
+        } else {
+            (status, rep)
+        };
         match status {
             s if (200..300).contains(&s) => Ok(ConditionalPut::Written(rep)),
             412 | 409 => Ok(ConditionalPut::PreconditionFailed),
@@ -720,7 +776,7 @@ mod tests {
         // 本机 / 内网 http 允许
         let cfg = S3Config { endpoint: "http://127.0.0.1:9000".into(), ..cfg };
         assert!(S3Store::new(&cfg).is_ok());
-        let cfg = S3Config { endpoint: "http://192.168.30.25:7480".into(), ..cfg };
+        let cfg = S3Config { endpoint: "http://192.168.1.10:7480".into(), ..cfg };
         assert!(S3Store::new(&cfg).is_ok(), "内网私有 IP 放行（局域网 Ceph）");
         // 无 scheme 补 https
         let cfg = S3Config { endpoint: "minio.example.com:9000".into(), ..cfg };

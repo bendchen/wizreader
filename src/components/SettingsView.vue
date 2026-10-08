@@ -39,9 +39,8 @@ const canRebuild = computed(() =>
       : false
 )
 
-/** U4：本机是否只读端（reader）—— 写入口与「上行」都要按它禁用（R7） */
-const isReader = computed(() => form.value.role === 'reader')
-/** 同上，但取**已保存**的角色：回收站恢复等写操作的判据必须是后端真正生效的那个值 */
+/** U4/R7：本机是否只读端（reader），取**已保存**的角色 ——
+ *  回收站恢复等写操作与「同步仅下行」的判据必须是后端真正生效的那个值 */
 const savedIsReader = computed(() => syncCfg.value?.config.role === 'reader')
 
 onMounted(async () => {
@@ -215,8 +214,10 @@ async function initSync() {
   syncMsg.value = ''
   syncProgress.value = ''
   try {
+    // 后端返回 { report: SyncReport }（嵌套），报告本体在 .report 里
     const rep = await api.initCloudSync(form.value.role)
-    syncMsg.value = '初始化完成：' + syncReportSummary(rep)
+    const r = rep.report ?? rep
+    syncMsg.value = '初始化完成：' + syncReportSummary(r)
     await loadSync()
   } catch (e) {
     syncMsg.value = String(e)
@@ -226,16 +227,31 @@ async function initSync() {
   }
 }
 
-async function doSync(direction: 'up' | 'down') {
-  syncBusy.value = direction
+/** 一键同步（§4.2 待办落地 2026-09-20）：写入端按 **下行对齐 → 上行** 顺序执行；
+ *  只读端仅下行（上行被 READER_READONLY 禁止，也不该尝试）。
+ *  下行失败即中止本轮（不强行上行）：对齐是上行的前置（§7.1），失败原因照实展示。 */
+async function doSync() {
+  syncBusy.value = 'down'
   syncMsg.value = ''
   syncProgress.value = ''
   try {
-    const rep = await api.runSync(direction)
-    syncMsg.value = (direction === 'up' ? '上行' : '下行') + '完成：' + syncReportSummary(rep)
+    const down = await api.runSync('down')
     await loadSync()
+    if (savedIsReader.value) {
+      syncMsg.value = '下行完成：' + syncReportSummary(down)
+      return
+    }
+    syncBusy.value = 'up'
+    try {
+      const up = await api.runSync('up')
+      await loadSync()
+      syncMsg.value =
+        '同步完成（下行 ' + syncReportSummary(down) + '；上行 ' + syncReportSummary(up) + '）'
+    } catch (e) {
+      syncMsg.value = '下行已完成（' + syncReportSummary(down) + '），上行失败：' + String(e)
+    }
   } catch (e) {
-    syncMsg.value = String(e)
+    syncMsg.value = '下行失败（本轮未上行）：' + String(e)
   } finally {
     syncBusy.value = ''
     syncProgress.value = ''
@@ -547,22 +563,13 @@ async function update(patch: Partial<Settings>) {
         </label>
       </div>
       <div class="settings-row">
-        <label>同步根</label>
-        <span style="color: var(--text-2); font-size: 12px">
-          恒为笔记库根：<code class="path-code">{{ settings?.library_dir ?? '（尚未设置）' }}</code>
-          —— 没有第二个根可挑（要换请到上方「主数据目录」改，Q18：不得等于/嵌套源数据目录）
-        </span>
-      </div>
-      <div class="settings-row">
         <label>Endpoint</label>
         <input class="text-input" v-model="form.endpoint" placeholder="http://minio.example.local:9000" />
         <label class="inline-check"><input v-model="form.path_style" type="checkbox" /> path-style（MinIO 建议）</label>
       </div>
       <div class="settings-row">
-        <label>Bucket / Prefix</label>
-        <input class="text-input" v-model="form.bucket" placeholder="wizreader" style="width: 140px" />
-        <input class="text-input" v-model="form.prefix" placeholder="sync/v1" style="width: 140px" />
-        <input class="text-input" v-model="form.region" placeholder="region" style="width: 100px" />
+        <label>Bucket</label>
+        <input class="text-input" v-model="form.bucket" placeholder="wizreader" style="width: 220px" />
       </div>
       <div class="settings-row">
         <label>Access Key</label>
@@ -575,10 +582,7 @@ async function update(patch: Partial<Settings>) {
         />
       </div>
       <div class="settings-row">
-        <label>数据格式 / 并发</label>
-        <span style="color: var(--text-2); font-size: 12px">
-          native（无损：源 zip 逐字节拷贝，不可选 —— D0）
-        </span>
+        <label>并发</label>
         <input
           type="number"
           :value="form.concurrency"
@@ -625,14 +629,18 @@ async function update(patch: Partial<Settings>) {
       </div>
       <div class="settings-row" style="margin-top: 8px">
         <label>手动同步</label>
-        <button
-          :disabled="syncBusy !== '' || isReader"
-          :title="isReader ? '只读端以云端为准，不支持上行；请到写入端上行' : ''"
-          @click="doSync('up')"
-        >
-          {{ syncBusy === 'up' ? '上行中…' : '立即上行' }}
+        <button :disabled="syncBusy !== ''" @click="doSync">
+          {{
+            syncBusy === 'down' ? '下行对齐中…' : syncBusy === 'up' ? '上行中…' : '立即同步'
+          }}
         </button>
-        <button :disabled="syncBusy !== ''" @click="doSync('down')">{{ syncBusy === 'down' ? '下行中…' : '立即下行' }}</button>
+        <span style="color: var(--text-2); font-size: 12px">
+          {{
+            savedIsReader
+              ? '只读端：仅下行（以云端为准）'
+              : '按「先下行对齐 → 再上行」执行（上行前必须对齐，§7.1）'
+          }}
+        </span>
         <span class="progress-text">{{ syncProgress }}</span>
       </div>
       <div class="settings-row">

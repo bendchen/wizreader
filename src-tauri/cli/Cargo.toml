@@ -1,6 +1,6 @@
 [package]
 name = "wiz-cli"
-version = "1.0.0"
+version = "1.5.0"
 edition = "2021"
 description = "WizReader 命令行工具（build-index / search / peek）"
 

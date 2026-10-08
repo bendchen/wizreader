@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, nextTick } from 'vue'
-import { api, writeErrorText, type Settings, type NoteItem, type ViewContext, type NoteWriteReport, type TreeNode } from './api'
+import { ref, onMounted, computed, nextTick, watch } from 'vue'
+import { api, writeErrorText, type Settings, type NoteItem, type ViewContext, type NoteWriteReport, type TreeNode, type SyncReport } from './api'
 import { exportNotesTo, exportNotesAsZips, exportNoteAs } from './exporter'
 import FolderTree from './components/FolderTree.vue'
 import NoteList from './components/NoteList.vue'
@@ -19,6 +19,74 @@ const searchInput = ref<HTMLInputElement | null>(null)
 const history = ref<string[]>([])
 const treeRef = ref<InstanceType<typeof FolderTree> | null>(null)
 const bootError = ref('')
+
+// ---------- 三栏宽度可调（目录 / 列表 / 阅读区，拖拽分隔条改宽度并持久化）----------
+const noteListRef = ref<InstanceType<typeof NoteList> | null>(null)
+const searchPaneRef = ref<HTMLElement | null>(null)
+/** 阅读区最小宽度：拖宽左/中栏时保证它不被挤没 */
+const MIN_READER = 360
+type PaneKey = 'tree' | 'list' | 'search'
+const PANE_MIN: Record<PaneKey, number> = { tree: 160, list: 200, search: 140 }
+let paneDrag: { key: PaneKey; el: HTMLElement; startX: number; startW: number; max: number } | null =
+  null
+
+function paneEl(key: PaneKey): HTMLElement | null {
+  if (key === 'tree') return (treeRef.value?.$el as HTMLElement) ?? null
+  if (key === 'list') return (noteListRef.value?.$el as HTMLElement) ?? null
+  return searchPaneRef.value
+}
+
+function onSplitDown(key: PaneKey, e: PointerEvent) {
+  const el = paneEl(key)
+  if (!el) return
+  // 拖某栏时另一栏宽度不变、阅读区（flex:1）吸收变化：
+  // max = 窗口宽 - 另一栏当前宽 - 阅读区最小宽
+  const otherKey: PaneKey | null = key === 'tree' ? 'list' : key === 'list' ? 'tree' : null
+  const otherW = otherKey ? (paneEl(otherKey)?.getBoundingClientRect().width ?? 0) : 0
+  let max = window.innerWidth - MIN_READER - otherW
+  if (key === 'search') max = Math.min(max, window.innerWidth * 0.4) // 检索范围栏别拖太宽
+  paneDrag = { key, el, startX: e.clientX, startW: el.getBoundingClientRect().width, max }
+  ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  document.body.classList.add('col-resizing')
+}
+function onSplitMove(e: PointerEvent) {
+  if (!paneDrag) return
+  const w = Math.min(
+    paneDrag.max,
+    Math.max(PANE_MIN[paneDrag.key], paneDrag.startW + e.clientX - paneDrag.startX)
+  )
+  paneDrag.el.style.width = `${Math.round(w)}px`
+}
+function onSplitUp() {
+  if (!paneDrag) return
+  const { key, el } = paneDrag
+  paneDrag = null
+  document.body.classList.remove('col-resizing')
+  try {
+    const saved = JSON.parse(localStorage.getItem('wizreader.pane_widths') ?? '{}')
+    saved[key] = el.getBoundingClientRect().width
+    localStorage.setItem('wizreader.pane_widths', JSON.stringify(saved))
+  } catch {
+    /* 持久化失败不影响功能 */
+  }
+}
+
+/** 把持久化的栏宽应用到当前视图（启动 / 视图与上下文切换后都会调） */
+async function applyPaneWidths() {
+  await nextTick()
+  let saved: Record<string, number> = {}
+  try {
+    saved = JSON.parse(localStorage.getItem('wizreader.pane_widths') ?? '{}')
+  } catch {
+    return
+  }
+  for (const key of ['tree', 'list', 'search'] as PaneKey[]) {
+    const w = saved[key]
+    if (typeof w !== 'number' || !Number.isFinite(w)) continue
+    const el = paneEl(key)
+    if (el) el.style.width = `${Math.round(Math.max(PANE_MIN[key], w))}px`
+  }
+}
 
 // ---------- 视图上下文（未打开 / 库 / 为知源）----------
 // none = 未打开任何笔记：未设置数据目录，或数据目录的清单（export.db）不可读。
@@ -89,7 +157,7 @@ const emptyReason = computed(() => {
 })
 const emptyHint = computed(() =>
   libraryKind.value === 'empty'
-    ? '该目录已设为笔记库，但还没有导出的笔记。可先从为知笔记导入，或另选一个已有内容的目录。'
+    ? '该目录已设为笔记库，但还没有内容。可直接新建笔记 / 目录开始写作，或从为知笔记导入。'
     : '为避免把为知笔记原始数据误当自有笔记，此处不会自动改用「为知笔记」——请修复数据目录后重试。'
 )
 
@@ -98,6 +166,7 @@ onMounted(async () => {
   applyTheme()
   await refreshStatus()
   loadHistory()
+  void applyPaneWidths()
   // 索引 / 导出进度事件（顶栏进度条）
   const { listen } = await import('@tauri-apps/api/event')
   listen<{ done: number; total: number }>('index-progress', (e) => {
@@ -201,10 +270,77 @@ async function afterWrite() {
     treeRef.value?.load().catch(() => undefined),
     refreshStatus().catch(() => undefined),
   ])
+  // 写路径统一收口 ⇒ 防抖自动同步也从这里触发（见 scheduleAutoSync）
+  scheduleAutoSync()
 }
 
 function writeFailed(e: unknown, what: string) {
   alert(`${what}失败\n\n${writeErrorText(e)}`)
+}
+
+// ---- 防抖自动同步（方案 1：保存后静默数秒自动「下行对齐 → 上行」）----
+// 触发点 = afterWrite()（新建/改名/移动/删除/导入/编辑器保存的统一收口）。
+// 资格在**点火时**现查（而非调度时）：设置页可能刚改过云同步配置。
+// 互斥：后端 run_sync 自带库根 .sync.lock（冲突时返回 SYNC_BUSY）——自动轮遇
+// BUSY 一律静默让位（手动同步优先）；上行前置=先下行对齐（§7.1），失败即中止本轮。
+const AUTO_SYNC_DEBOUNCE_MS = 4000
+let autoSyncTimer: number | null = null
+let autoSyncRunning = false
+let autoSyncPending = false // 轮次进行中又有写操作 ⇒ 本轮结束后补一轮
+
+function scheduleAutoSync() {
+  if (autoSyncTimer) window.clearTimeout(autoSyncTimer)
+  autoSyncTimer = window.setTimeout(() => {
+    autoSyncTimer = null
+    void runAutoSync()
+  }, AUTO_SYNC_DEBOUNCE_MS)
+}
+
+async function runAutoSync() {
+  if (autoSyncRunning) {
+    autoSyncPending = true
+    return
+  }
+  autoSyncRunning = true
+  try {
+    try {
+      const { config } = await api.getSyncConfig()
+      if (!config.enabled || !config.initialized || config.role !== 'writer') return
+    } catch {
+      return // 配置读不到（未设置目录等）⇒ 无从同步，跳过本轮
+    }
+    let down: SyncReport
+    try {
+      down = await api.runSync('down')
+    } catch (e) {
+      if (String(e).includes('SYNC_BUSY')) return
+      showToast('自动同步失败（下行对齐）：' + writeErrorText(e))
+      return
+    }
+    let up: SyncReport
+    try {
+      up = await api.runSync('up')
+    } catch (e) {
+      if (String(e).includes('SYNC_BUSY')) return
+      showToast('自动同步失败（上行）：' + writeErrorText(e))
+      return
+    }
+    const parts: string[] = []
+    if (up.uploaded > 0) parts.push(`上行 ${up.uploaded} 篇`)
+    const pulled = down.downloaded + down.trashed
+    if (pulled > 0) parts.push(`下行 ${pulled} 项`)
+    const conflicts = down.conflicts + up.conflicts
+    if (conflicts > 0) parts.push(`冲突旁置 ${conflicts} 篇`)
+    showToast(
+      parts.length ? `自动同步完成：${parts.join('，')}` : '自动同步完成：云端已是最新',
+    )
+  } finally {
+    autoSyncRunning = false
+    if (autoSyncPending) {
+      autoSyncPending = false
+      scheduleAutoSync()
+    }
+  }
 }
 
 /** U4 / R7：只读端不得写。入口置灰已挡住绝大多数路径，这里再挡一次（防止遗留的右键菜单/快捷键路径绕过） */
@@ -317,7 +453,7 @@ async function revealNote(item: NoteItem) {
 
 // ---------- 通用小弹窗（新建笔记 / 重命名输入 / 危险确认 / 目标目录选择）----------
 type DialogState = {
-  kind: 'prompt' | 'confirm' | 'folder' | 'new'
+  kind: 'prompt' | 'confirm' | 'folder' | 'new' | 'new_folder'
   title: string
   message: string
   initial?: string
@@ -326,6 +462,8 @@ type DialogState = {
   folders?: { path: string; name: string; depth: number }[]
   current?: string
   item?: NoteRef
+  /** new_folder：在哪个目录之下创建（'/' = 库根） */
+  base?: string
 } | null
 const dialog = ref<DialogState>(null)
 /** 新建笔记进行中（防双击重复建） */
@@ -346,10 +484,67 @@ async function onCreateNote() {
   }
 }
 
+// ---------- 空库（无清单）就绪 + 新建目录入口 ----------
+/** 空库就绪：无清单的空目录先建空 export.db 并切库上下文，刷新到三栏界面 */
+async function ensureLibraryReady(): Promise<boolean> {
+  try {
+    await api.initLibraryManifest()
+  } catch (e) {
+    alert(writeErrorText(e))
+    return false
+  }
+  await refreshStatus()
+  bootError.value = ''
+  await nextTick()
+  await treeRef.value?.load()
+  return true
+}
+
+/** 空态页「新建笔记」：先就绪空库，再走常规新建对话框 */
+async function createNoteFromEmpty() {
+  if (!(await ensureLibraryReady())) return
+  await onCreateNote()
+}
+
+/** 新建目录：在 base（库根或当前选中目录）之下创建；成功后树里立即可见 */
+function promptNewFolder(base: string) {
+  if (blockedByReaderRole('新建目录')) return
+  const b = base || '/'
+  dialog.value = {
+    kind: 'new_folder',
+    title: '新建目录',
+    message: `在「${b === '/' ? '全部笔记（库根）' : b}」下新建目录：`,
+    initial: '新目录',
+    confirmText: '创建',
+    base: b,
+  }
+}
+
+/** 空态页「新建目录」：先就绪空库，再弹目录名输入（建在库根下） */
+async function createFolderFromEmpty() {
+  if (!(await ensureLibraryReady())) return
+  promptNewFolder('/')
+}
+
 async function onDialogConfirm(value: string, folderPicked: string) {
   const d = dialog.value
   dialog.value = null
   if (!d) return
+  // 新建目录：value = 目录名，目标 = base（默认库根）之下；成功后刷新树并选中新目录
+  if (d.kind === 'new_folder') {
+    const base = d.base && d.base !== '/' ? d.base.replace(/\/+$/, '') : ''
+    const target = `${base}/${value}`
+    try {
+      const loc = await api.createLibraryFolder(target)
+      showToast(`已创建目录：${loc}`)
+      view.value = 'browse'
+      folder.value = loc
+      await afterWrite()
+    } catch (e) {
+      writeFailed(e, '新建目录')
+    }
+    return
+  }
   // 新建：无需 item（item 指向既有笔记）；创建成功后直接选中并进编辑器
   if (d.kind === 'new') {
     if (creating.value) return
@@ -429,6 +624,8 @@ window.addEventListener('keydown', async (e) => {
 })
 
 const showSettings = ref(false)
+// 视图（浏览/检索）与页面形态切换后，对应面板才挂载 ⇒ 切完重放一次持久化栏宽
+watch([view, viewContext, showSettings], () => void applyPaneWidths())
 const picking = ref(false)
 const pickTip = ref('')
 // 重建索引 / 导出进度（index-progress / export-progress 事件，done/total 篇）
@@ -894,6 +1091,12 @@ function toggleSettings() {
         <p v-if="emptyReason" class="empty-err">{{ emptyReason }}</p>
         <p class="empty-sub small">{{ emptyHint }}</p>
         <div class="empty-actions">
+          <button class="big-btn" :disabled="picking" @click="createNoteFromEmpty">
+            新建笔记
+          </button>
+          <button class="big-btn" :disabled="picking" @click="createFolderFromEmpty">
+            新建目录
+          </button>
           <button
             v-if="libraryKind === 'empty'"
             class="big-btn"
@@ -948,10 +1151,22 @@ function toggleSettings() {
           :droppable="writable"
           @select="folder = $event"
           @drop-note="onDropNote"
+          @create-folder="promptNewFolder(folder || '/')"
         />
+
+        <!-- 可拖拽分栏条：拖动调整目录/列表栏宽（阅读区吸收剩余空间） -->
+        <div
+          class="vsplit"
+          title="拖动调整目录栏宽度"
+          @pointerdown="onSplitDown('tree', $event)"
+          @pointermove="onSplitMove"
+          @pointerup="onSplitUp"
+          @pointercancel="onSplitUp"
+        ></div>
 
         <template v-if="view === 'browse'">
           <NoteList
+            ref="noteListRef"
             :folder="folder"
             :writable="writable"
             :version="listVersion"
@@ -964,6 +1179,14 @@ function toggleSettings() {
             @dragstart="onDragStart"
             @dragend="onDragEnd"
           />
+          <div
+            class="vsplit"
+            title="拖动调整列表栏宽度"
+            @pointerdown="onSplitDown('list', $event)"
+            @pointermove="onSplitMove"
+            @pointerup="onSplitUp"
+            @pointercancel="onSplitUp"
+          ></div>
           <Reader
             :guid="currentGuid"
             :settings="settings!"
@@ -977,7 +1200,7 @@ function toggleSettings() {
         </template>
 
         <template v-else>
-          <div class="panel" style="width: 220px; border-right: 1px solid var(--border)">
+          <div ref="searchPaneRef" class="panel search-scope">
             <div class="panel-head">检索范围</div>
             <div style="padding: 8px; font-size: 12px; color: var(--text-2)">
               范围：{{ folder ? folder : '全部目录' }}
@@ -989,6 +1212,14 @@ function toggleSettings() {
               </div>
             </div>
           </div>
+          <div
+            class="vsplit"
+            title="拖动调整检索范围栏宽度"
+            @pointerdown="onSplitDown('search', $event)"
+            @pointermove="onSplitMove"
+            @pointerup="onSplitUp"
+            @pointercancel="onSplitUp"
+          ></div>
           <SearchResults :kw="searchKw" :folder="folder" @open="openNote" />
           <Reader
             :guid="currentGuid"
@@ -1041,6 +1272,36 @@ export default defineComponent({
 </script>
 
 <style scoped>
+/* 可拖拽分栏条：视觉上只是 1px 分隔线，命中区 7px（负 margin 外扩，不占布局宽度） */
+.vsplit {
+  position: relative;
+  z-index: 5;
+  flex: none;
+  width: 7px;
+  margin: 0 -3px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.vsplit::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+.vsplit:hover::after,
+.vsplit:active::after {
+  left: 2.5px;
+  width: 2px;
+  background: var(--accent);
+}
+/* 检索视图「检索范围」栏默认宽（可被拖拽覆盖） */
+.search-scope {
+  width: 220px;
+  flex: none;
+}
 /* 上下文徽标 */
 .ctx-badge {
   display: inline-flex;

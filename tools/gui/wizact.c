@@ -92,5 +92,10 @@ int main(int argc,char**argv){
     chord(code,f); usleep(200000); printf("chord %d %s\n",code,m); return 0; }
   if(!strcmp(c,"appswitch")){ appswitch(atoi(argv[2])); usleep(400000); printf("appswitch %s\n",argv[2]); return 0; }
   if(!strcmp(c,"drag")){ CGPoint a={atof(argv[2]),atof(argv[3])}, b={atof(argv[4]),atof(argv[5])}; dragto(a,b); printf("dragged %.0f,%.0f -> %.0f,%.0f\n",a.x,a.y,b.x,b.y); return 0; }
+  if(!strcmp(c,"scroll")){ /* scroll <clicks>：正=向上滚，负=向下滚（WKWebView 页面内容滚动） */
+    CGPoint p=loc(); int n=atoi(argv[2]);
+    CGEventRef e=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitLine,1,n);
+    CGEventPost(kCGHIDEventTap,e); CFRelease(e);
+    usleep(300000); CGPoint q=loc(); printf("scrolled %d at %.0f,%.0f\n",n,q.x,q.y); return 0; }
   fprintf(stderr,"unknown cmd %s\n",c); return 2;
 }

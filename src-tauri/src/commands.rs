@@ -480,13 +480,24 @@ pub fn get_sync_status(state: State<AppState>) -> SyncStatusView {
         trash_items = count_tree_files(&trash);
         trash_bytes = tree_bytes(&trash);
     }
+    // 【真云 GUI 实测发现（2026-09-20）】此前这里写死 0（注释称"避免阻塞 UI 的网络调用"），
+    // 但本地水位只是读库清单 sqlite 的一个 meta 键，**零网络零阻塞** —— 状态栏的
+    // "revision" 于是永远显示 0。改为直读本地清单；清单缺失/未设库时回退 0。
+    let local_revision = state
+        .settings
+        .lock()
+        .unwrap()
+        .sync_root()
+        .and_then(|root| crate::manifest::open_readonly(&root).ok())
+        .map(|conn| crate::manifest::current_revision(&conn))
+        .unwrap_or(0);
     SyncStatusView {
         enabled: s.enabled,
         role: s.role.clone(),
         initialized: s.initialized,
         last_sync_at,
         last_report,
-        local_revision: 0, // 启动任务/同步时刷新；此处避免阻塞 UI 的网络调用
+        local_revision,
         trash_items,
         trash_bytes,
     }
@@ -654,7 +665,8 @@ pub fn clear_cloud_credentials(state: State<AppState>) -> Result<(), String> {
 }
 
 // `pick_sync_root` 已随 U1 删除：**同步根恒为库根**，没有第二个根可挑。
-// 用户能选的只有「主数据目录」（`pick_library_dir`），Q18 红线（同步根不得等于/嵌套源目录）
+// 用户能选的只有「主数据目录」（`pick_library_dir`），Q18 红线（唯一目的 = 为知原笔记不可修改：
+// 库根不得等于/位于为知源数据目录之内；库包含源放行 —— 2026-09-20 用户澄清）
 // 改在 `validate_sync` 里对库根施加。留着这条命令只会让"库根"与"同步根"重新变成两个东西。
 
 fn index_db_of(state: &AppState) -> Result<PathBuf, String> {
@@ -1647,6 +1659,46 @@ pub fn set_view_context(state: State<AppState>, context: String) -> Result<ViewC
     Ok(ctx)
 }
 
+/// 空库初始化：目录已设为笔记库但**还没有清单**（export.db）时，按当前 schema
+/// 建立一份空清单并切到库上下文 —— 此后「新建笔记 / 新建目录」即可直接使用。
+/// 只对 `validate_library` 判为 `empty` 的目录生效：`no_manifest`（有 zip 无清单）
+/// 绝不凭空造清单（zip 会变孤儿），必须走 manifest-rebuild 重建。幂等：已有清单直接切上下文。
+/// 建清单后**同步重建派生索引**（索引文件在库根之外，可能残留旧内容）。
+#[tauri::command]
+pub async fn init_library_manifest(state: State<'_, AppState>) -> Result<(), String> {
+    let lib = state
+        .library_dir()
+        .ok_or("LIBRARY_UNSET: 未设置笔记库目录，请先「设置数据目录」")?;
+    if !crate::manifest::manifest_path(&lib).is_file() {
+        let lib2 = lib.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::library::init_empty_library_manifest(
+                &lib2,
+                &crate::config::index_file_for_library(&lib2),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        append_sync_log("库初始化：空目录建立清单（export.db）+ 重建派生索引");
+    }
+    // 清单就绪 → 切库上下文（注入 LibraryResolver；写路径 write_targets 依赖它）
+    apply_context(&state, ViewContext::Library)
+}
+
+/// 新建目录（库内）：磁盘建目录 + 索引 folder 表补行。清单不记目录
+/// （目录 = 笔记 location 推导 + 磁盘实况），故无清单写、无置脏。返回规范化 location。
+#[tauri::command]
+pub async fn create_folder_cmd(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let (lib, index_db) = write_targets(&state)?;
+    let created = tauri::async_runtime::spawn_blocking(move || {
+        crate::library::create_folder(&lib, &index_db, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    append_sync_log(&format!("库写入 create_folder {}", created));
+    Ok(created)
+}
+
 // ---------- 笔记库写入（FR-11 P2 / S1：库内编辑正文、重命名、移动、删除） ----------
 //
 // 一律：① 库上下文才允许（源视图是只读导入路径）；② 重 I/O 走 spawn_blocking；
@@ -1783,6 +1835,86 @@ pub async fn save_note_source_cmd(
     append_sync_log(&format!(
         "库写入 {} {} → {}（{} B, rev {}）",
         report.op, report.guid, report.exported_path, report.exported_size, report.revision
+    ));
+    Ok(report)
+}
+
+/// M4 图片插入（文件选择器路径）：后端读用户**刚在系统对话框里选中**的文件并写入包内。
+/// 为什么不让前端读字节再传：那需要一个通用的"按路径读文件"命令，是一把不该发给
+/// WebView 的万能钥匙 —— 这里文件路径只作为"用户刚选过"的凭证，服务端一次读一次写。
+#[tauri::command]
+pub async fn add_note_image_file_cmd(
+    state: State<'_, AppState>,
+    guid: String,
+    file_path: String,
+) -> Result<crate::library::NoteImageReport, String> {
+    let (lib, index_db) = write_targets(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&file_path).map_err(|e| format!("IMAGE_READ_FAILED: {e}"))?;
+        let name = std::path::Path::new(&file_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        crate::library::add_note_image(&lib, &index_db, &guid, &bytes, name.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.invalidate_library_cache()?;
+    append_sync_log(&format!(
+        "库写入 add-image {} {} → {}（复用={})",
+        report.guid, report.entry, report.exported_path, report.reused
+    ));
+    Ok(report)
+}
+
+/// M4 图片插入（粘贴路径）：剪贴板里的图片字节（截图 / 网页复制）走 base64 过 IPC。
+#[tauri::command]
+pub async fn add_note_image_data_cmd(
+    state: State<'_, AppState>,
+    guid: String,
+    data_b64: String,
+    name: Option<String>,
+) -> Result<crate::library::NoteImageReport, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("IMAGE_B64_DECODE: {e}"))?;
+    let (lib, index_db) = write_targets(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        crate::library::add_note_image(&lib, &index_db, &guid, &bytes, name.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.invalidate_library_cache()?;
+    append_sync_log(&format!(
+        "库写入 add-image {} {} → {}（复用={})",
+        report.guid, report.entry, report.exported_path, report.reused
+    ));
+    Ok(report)
+}
+
+/// M4 附件插入（最小版）：系统对话框选中的**任意文件**写入包内 `attachments/`，
+/// 正文由前端插链接引用。与图片同为「按路径读」凭证模式（不给 WebView 万能钥匙），
+/// 50 MB 上限的文件也不该走 base64 过 IPC —— 后端一次读一次写。
+#[tauri::command]
+pub async fn add_note_attachment_cmd(
+    state: State<'_, AppState>,
+    guid: String,
+    file_path: String,
+) -> Result<crate::library::NoteImageReport, String> {
+    let (lib, index_db) = write_targets(&state)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&file_path).map_err(|e| format!("ATTACHMENT_READ_FAILED: {e}"))?;
+        let name = std::path::Path::new(&file_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        crate::library::add_note_attachment(&lib, &index_db, &guid, &bytes, name.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.invalidate_library_cache()?;
+    append_sync_log(&format!(
+        "库写入 add-attachment {} {} → {}（复用={})",
+        report.guid, report.entry, report.exported_path, report.reused
     ));
     Ok(report)
 }

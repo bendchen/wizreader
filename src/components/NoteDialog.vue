@@ -9,7 +9,7 @@
 import { ref, computed, watch, nextTick } from 'vue'
 
 const props = defineProps<{
-  kind: 'prompt' | 'confirm' | 'folder' | 'new'
+  kind: 'prompt' | 'confirm' | 'folder' | 'new' | 'new_folder'
   title: string
   message: string
   /** prompt/new：初值；confirm：确认按钮文案 */
@@ -43,7 +43,8 @@ watch(
 )
 
 const canConfirm = computed(() => {
-  if (props.kind === 'prompt') return value.value.trim().length > 0
+  if (props.kind === 'prompt' || props.kind === 'new_folder')
+    return value.value.trim().length > 0
   if (props.kind === 'folder') return picked.value !== '' && picked.value !== props.current
   if (props.kind === 'new') return value.value.trim().length > 0 && picked.value !== ''
   return true
@@ -52,7 +53,10 @@ const canConfirm = computed(() => {
 function ok() {
   if (!canConfirm.value) return
   const folder = props.kind === 'folder' || props.kind === 'new' ? picked.value : ''
-  const value0 = props.kind === 'prompt' || props.kind === 'new' ? value.value.trim() : picked.value
+  const value0 =
+    props.kind === 'prompt' || props.kind === 'new' || props.kind === 'new_folder'
+      ? value.value.trim()
+      : picked.value
   emit('confirm', value0, folder)
 }
 </script>
@@ -64,12 +68,12 @@ function ok() {
       <div class="dlg-msg">{{ message }}</div>
 
       <input
-        v-if="kind === 'prompt' || kind === 'new'"
+        v-if="kind === 'prompt' || kind === 'new' || kind === 'new_folder'"
         ref="input"
         v-model="value"
         type="text"
         class="dlg-input"
-        placeholder="笔记标题"
+        :placeholder="kind === 'new_folder' ? '目录名' : '笔记标题'"
       />
 
       <div v-if="kind === 'folder' || kind === 'new'" class="dlg-folders">

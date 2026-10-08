@@ -70,6 +70,11 @@ body {
 }
 .topbar button:hover, .panel button:hover { background: var(--bg-3); }
 .main { display: flex; flex: 1; min-height: 0; }
+/* 拖拽分栏条进行中：全局禁选中 + 强制列向调整光标 */
+body.col-resizing {
+  cursor: col-resize !important;
+  user-select: none;
+}
 
 .panel { display: flex; flex-direction: column; min-height: 0; }
 .panel-head {
@@ -81,8 +86,9 @@ body {
   flex: none;
   display: flex; align-items: center; gap: 6px;
 }
-.panel-tree { width: 260px; border-right: 1px solid var(--border); background: var(--bg-2); }
-.panel-list { width: 340px; border-right: 1px solid var(--border); }
+/* 面板自身不画右边框：三栏之间的分隔线由 App.vue 的可拖拽分栏条（.vsplit）负责 */
+.panel-tree { width: 260px; background: var(--bg-2); }
+.panel-list { width: 340px; }
 .panel-reader { flex: 1; background: var(--bg); }
 
 .tree-scroll, .list-scroll, .reader-scroll { overflow: auto; flex: 1; }

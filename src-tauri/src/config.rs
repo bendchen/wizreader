@@ -354,7 +354,10 @@ pub fn validate_sync(
     Ok(())
 }
 
-/// Q18：`root` 不得等于 / 位于 `data_dir` 之下、也不得是 `data_dir` 的祖先。
+/// Q18（2026-09-20 用户澄清口径）：红线**唯一目的 = 为知原笔记不可修改**。
+/// `root`（= 库根）不得等于 / 位于 `data_dir` 之下；**库包含源（祖先方向）放行** ——
+/// 库内写入均为结构化子路径（notes/…、_attachments/、_trash/、_conflicts/、export.db），
+/// 不会触碰嵌套在库里的源目录，而库内数据用户有完全控制权（旧版第 3 条「祖先也拒」废止）。
 /// 两侧先 `canonicalize`（规避符号链接绕过与 macOS `/var → /private/var` 之类链接）；
 /// 不存在的路径对**最深存在祖先**做 canonicalize 后再拼回剩余段，保证与已存在路径可比。
 pub fn validate_sync_root(root: &Path, data_dir: Option<&str>) -> Result<(), String> {
@@ -365,13 +368,10 @@ pub fn validate_sync_root(root: &Path, data_dir: Option<&str>) -> Result<(), Str
         }
         let d = canon_best_effort(Path::new(dd));
         if r == d {
-            return Err("SYNC_ROOT_UNDER_SOURCE: 同步根不得与源数据目录相同（G1：源数据零写入）".into());
+            return Err("SYNC_ROOT_UNDER_SOURCE: 同步根（=笔记库根）不得与为知源数据目录相同（G1：为知原笔记只读）".into());
         }
         if r.starts_with(&d) {
-            return Err("SYNC_ROOT_UNDER_SOURCE: 同步根不得位于源数据目录之下（G1：源数据零写入）".into());
-        }
-        if d.starts_with(&r) {
-            return Err("SYNC_ROOT_UNDER_SOURCE: 同步根不得包含源数据目录（避免同步清理越界）".into());
+            return Err("SYNC_ROOT_UNDER_SOURCE: 同步根（=笔记库根）不得位于为知源数据目录之内（G1：为知原笔记只读）".into());
         }
     }
     // 可写性：存在则探测写权限，不存在则尝试创建
@@ -412,8 +412,9 @@ pub fn canon_best_effort(p: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- 库根校验（FR-11，R9 红线）
 
-/// 库根红线（§6.2 / R9）：`library_dir` 不得与源数据目录相等 / 互为父子
-///（防止写入污染为知数据）；复用 Q18 的 `canon_best_effort` 思路防符号链接绕过。
+/// 库根红线（§6.2 / R9，2026-09-20 与 Q18 同步澄清）：`library_dir` 不得与为知源数据目录
+/// 相等 / 位于其之内（红线唯一目的 = 为知原笔记不可修改）；**库包含源放行**（库内数据用户完全控制，
+/// 库内写入均为结构化子路径，不会触碰嵌套的源目录）。复用 Q18 的 `canon_best_effort` 思路防符号链接绕过。
 /// 目录不存在时顺带创建 + 可写探测（与 `validate_sync_root` 同构）。
 pub fn validate_library_root(library: &Path, source_dir: Option<&str>) -> Result<(), String> {
     let l = canon_best_effort(library);
@@ -421,13 +422,10 @@ pub fn validate_library_root(library: &Path, source_dir: Option<&str>) -> Result
         if !sd.trim().is_empty() {
             let d = canon_best_effort(Path::new(sd));
             if l == d {
-                return Err("LIBRARY_ROOT_UNDER_SOURCE: 库根不得与源数据目录相同（G1：源数据零写入）".into());
+                return Err("LIBRARY_ROOT_UNDER_SOURCE: 库根不得与为知源数据目录相同（G1：为知原笔记只读）".into());
             }
             if l.starts_with(&d) {
-                return Err("LIBRARY_ROOT_UNDER_SOURCE: 库根不得位于源数据目录之下（G1：源数据零写入）".into());
-            }
-            if d.starts_with(&l) {
-                return Err("LIBRARY_ROOT_UNDER_SOURCE: 库根不得包含源数据目录（R9：避免写入污染源数据）".into());
+                return Err("LIBRARY_ROOT_UNDER_SOURCE: 库根不得位于为知源数据目录之内（G1：为知原笔记只读）".into());
             }
         }
     }
@@ -505,7 +503,7 @@ mod tests {
         assert!(validate_sync(&s, None, None).unwrap_err().contains("SYNC_INSECURE_ENDPOINT"));
         s.endpoint = "http://127.0.0.1:9000".into();
         assert!(validate_sync(&s, None, None).is_ok(), "本机 http 放行");
-        s.endpoint = "http://192.168.30.25:7480".into();
+        s.endpoint = "http://192.168.1.10:7480".into();
         assert!(validate_sync(&s, None, None).is_ok(), "内网私有 IP http 放行（如局域网 Ceph）");
         s.endpoint = "http://10.0.0.5:9000".into();
         assert!(validate_sync(&s, None, None).is_ok(), "10/8 内网放行");
@@ -557,10 +555,10 @@ mod tests {
         // 之下 → 拒
         let err = validate_sync_root(&dd.join("sync"), Some(&dd_s)).unwrap_err();
         assert!(err.contains("SYNC_ROOT_UNDER_SOURCE"));
-        // 祖先（包含源目录）→ 拒
+        // 祖先（库包含源目录）→ **放行**（2026-09-20 用户澄清：库内数据用户完全控制，
+        // 库内写入均为结构化子路径，不会触碰嵌套的源目录；旧版此处拒）
         let parent = dd.parent().unwrap().to_path_buf();
-        let err = validate_sync_root(&parent, Some(&dd_s)).unwrap_err();
-        assert!(err.contains("SYNC_ROOT_UNDER_SOURCE"), "{err}");
+        validate_sync_root(&parent, Some(&dd_s)).unwrap();
         // 兄弟目录 → 放行
         let sibling = dd.parent().unwrap().join(format!("wiz-q18-ok-{}", std::process::id()));
         validate_sync_root(&sibling, Some(&dd_s)).unwrap();
@@ -614,7 +612,7 @@ mod tests {
         assert!(out.contains("source_dir") && !out.contains("data_dir"));
     }
 
-    /// R9 红线三态：相等 / 之下 / 祖先均拒，兄弟目录放行（与 Q18 同构，含创建）
+    /// R9 红线（2026-09-20 澄清后两态）：相等 / 之下拒，库包含源放行，兄弟目录放行（与 Q18 同构，含创建）
     #[test]
     fn test_library_root_red_lines() {
         let sd = std::env::temp_dir().join(format!("wiz-lib-src-{}", std::process::id()));
@@ -626,9 +624,9 @@ mod tests {
         assert!(err.contains("LIBRARY_ROOT_UNDER_SOURCE"), "{err}");
         let err = validate_library_root(&sd.join("lib"), Some(&sd_s)).unwrap_err();
         assert!(err.contains("LIBRARY_ROOT_UNDER_SOURCE"));
+        // 祖先（库包含源目录）→ **放行**（2026-09-20 用户澄清，同 Q18）
         let parent = sd.parent().unwrap().to_path_buf();
-        let err = validate_library_root(&parent, Some(&sd_s)).unwrap_err();
-        assert!(err.contains("LIBRARY_ROOT_UNDER_SOURCE"), "{err}");
+        validate_library_root(&parent, Some(&sd_s)).unwrap();
 
         let ok_dir = std::env::temp_dir().join(format!("wiz-lib-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ok_dir);

@@ -344,6 +344,26 @@ export interface NoteSource {
   text: string
 }
 
+/**
+ * M4 图片插入结果（与 Rust `library::NoteImageReport` 对齐）。
+ * `entry` 就是写进正文的相对引用（`index_files/…`）；`reused=true` 表示
+ * 包内已有同内容条目、本次零写入复用（同一张图重复插入不重写包）。
+ */
+export interface NoteImageReport {
+  entry: string
+  reused: boolean
+  op: string
+  guid: string
+  exported_path: string
+  exported_size: number
+  exported_md5: string
+  data_modified: string
+  revision: number
+  manifest_revision: number
+  index_updated: boolean
+  warnings: string[]
+}
+
 export const api = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (s: Settings) => invoke<void>('update_settings', { settings: s }),
@@ -396,6 +416,10 @@ export const api = {
   getLibraryStatus: () => invoke<LibraryStatusView>('get_library_status'),
   /** 切换视图上下文：'library' | 'source' | 'none' */
   setViewContext: (context: ViewContext) => invoke<ViewContext>('set_view_context', { context }),
+  /** 空库初始化：目录无清单（kind=empty）时建立空 export.db 并切库上下文（幂等） */
+  initLibraryManifest: () => invoke<void>('init_library_manifest'),
+  /** 库内新建目录（磁盘 + 索引 folder 表；返回规范化 location `/a/b/`） */
+  createLibraryFolder: (path: string) => invoke<string>('create_library_folder', { path }),
 
   // ---------- 笔记库编辑（FR-11 P2 / S2；M3 起形态自适应）----------
   /** 新建笔记（origin=local）：生成 guid + md 包 + 清单插行（置脏）+ 单篇索引 */
@@ -425,6 +449,18 @@ export const api = {
    */
   saveNoteSource: (guid: string, text: string) =>
     invoke<NoteWriteReport>('save_note_source_cmd', { guid, text }),
+  /**
+   * M4：把一张图片写入笔记包 `index_files/`（文件选择器路径 —— 后端读用户刚选的文件，
+   * 不给 WebView 发"按路径读文件"的万能钥匙）。返回的 `entry` 直接填进正文引用。
+   */
+  addNoteImageFile: (guid: string, filePath: string) =>
+    invoke<NoteImageReport>('add_note_image_file_cmd', { guid, filePath }),
+  /** M4：粘贴路径 —— 图片字节以 base64 过 IPC，写入同一个包内位置 */
+  addNoteImageData: (guid: string, dataB64: string, name: string | null) =>
+    invoke<NoteImageReport>('add_note_image_data_cmd', { guid, dataB64, name }),
+  /** M4 最小版：把任意文件作为附件写入笔记包 `attachments/`，正文插链接引用 */
+  addNoteAttachment: (guid: string, filePath: string) =>
+    invoke<NoteImageReport>('add_note_attachment_cmd', { guid, filePath }),
   /** 重命名标题（落地文件名随标题变，云端键不变） */
   renameNote: (guid: string, newTitle: string) =>
     invoke<NoteWriteReport>('rename_note_cmd', { guid, newTitle }),
@@ -448,8 +484,11 @@ export const api = {
     invoke<void>('save_sync_config', { config, secretKey }),
   clearCloudCredentials: () => invoke<void>('clear_cloud_credentials'),
   // U1：`pick_sync_root` 已删 —— 同步根恒为笔记库根，唯一可选的根是 `pickLibraryDir`。
-  /** 首次初始化（按角色分流，后台执行，进度走 sync-progress 事件）；role: "writer" | "reader" */
-  initCloudSync: (role: string) => invoke<SyncReport>('init_cloud_sync', { role }),
+  /** 首次初始化（按角色分流，后台执行，进度走 sync-progress 事件）；role: "writer" | "reader"
+   *  【真云 GUI 实测发现（2026-09-20）】后端返回 `InitReport { report: SyncReport }`（嵌套一层），
+   *  不是扁平 SyncReport —— 之前声明成 SyncReport 导致 `syncReportSummary(rep)` 读
+   *  `rep.failures.length` 抛 TypeError（初始化报告永远渲染失败）。 */
+  initCloudSync: (role: string) => invoke<{ report: SyncReport }>('init_cloud_sync', { role }),
   /** direction: "up" | "down" */
   runSync: (direction: string) => invoke<SyncReport>('run_sync', { direction }),
   getSyncStatus: () => invoke<SyncStatusView>('get_sync_status'),
@@ -484,6 +523,15 @@ const WRITE_HINTS: Record<string, string> = {
   HTML_HOST_REF: '正文含 wiznote:// 宿主引用，会污染导出与巡检，请删除后再保存',
   MD_HOST_REF: '正文含 wiznote:// 宿主引用，会污染导出与巡检，请删除后再保存',
   ENTRY_NOT_FOUND: '该篇 zip 内没有 index.html（本期只改已有正文，不新建）',
+  ENTRY_EXISTS: '包内已有同名条目（追加不覆盖）',
+  NOT_IMAGE: '不是可识别的图片（只支持 png/jpg/gif/webp/bmp/svg）',
+  IMAGE_TOO_LARGE: '图片超过 20 MB 上限（大素材请走附件，不要塞进正文包）',
+  EMPTY_IMAGE: '图片内容为空',
+  IMAGE_READ_FAILED: '读取所选图片文件失败',
+  IMAGE_B64_DECODE: '剪贴板图片数据解码失败',
+  ATTACHMENT_TOO_LARGE: '附件超过 50 MB 上限（更大素材请等分档策略，不要塞进正文包）',
+  EMPTY_ATTACHMENT: '附件内容为空',
+  ATTACHMENT_READ_FAILED: '读取所选附件文件失败',
   TOMBSTONE_NOT_FOUND: '回收站里没有这一篇（可能已经恢复过）',
   NO_TOMBSTONE_PAYLOAD: '该墓碑来自旧版本，没有恢复载荷 —— 无法还原清单行',
   TRASH_FILE_MISSING: '回收站里已找不到该篇的文件（可能已被超期清理）',

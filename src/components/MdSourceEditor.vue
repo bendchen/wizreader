@@ -27,11 +27,16 @@ import {
   type MdAction,
   type Snapshot,
 } from '../mdedit'
+import { buildPastePayload, decidePaste, type PastePayload } from '../noteimage'
 
 const props = defineProps<{ modelValue: string }>()
 const emit = defineEmits<{
   (e: 'update:modelValue', v: string): void
   (e: 'input'): void
+  /** 粘贴里带了图（文件 / 内嵌 data: 图）→ 已 preventDefault，交给抽屉上传后回填 */
+  (e: 'paste-image', payload: PastePayload): void
+  /** ⇧⌘K 请求插图 → 由抽屉弹文件选择器（编辑器没有 guid，选不了文件） */
+  (e: 'image-request'): void
 }>()
 
 /**
@@ -167,6 +172,28 @@ function applyAction(action: MdAction) {
   applyEdit(runAction(snapshot(), action))
 }
 
+/**
+ * 在当前光标处原样插入一段文本（M4 图片/粘贴回填用）。
+ * 走 [`applyEdit`] ⇒ 保留原生撤销栈，Cmd+Z 能整段收回。
+ */
+function insertSnippet(snippet: string) {
+  const el = ta.value
+  if (!el) return
+  const start = el.selectionStart
+  const end = el.selectionEnd
+  const next = el.value.slice(0, start) + snippet + el.value.slice(end)
+  const at = start + snippet.length
+  applyEdit({ text: next, selStart: at, selEnd: at })
+}
+
+/** 粘贴拦截：有图（文件或内嵌 data: 图）就不让浏览器默认插入，交给抽屉上传 */
+function onPaste(e: ClipboardEvent) {
+  const payload = buildPastePayload(e)
+  if (decidePaste(payload) === 'none') return
+  e.preventDefault()
+  emit('paste-image', payload)
+}
+
 function onKeydown(e: KeyboardEvent) {
   const el = ta.value
   if (!el) return
@@ -218,7 +245,8 @@ function onKeydown(e: KeyboardEvent) {
       break
     case 'k':
       e.preventDefault()
-      applyAction(e.shiftKey ? 'image' : 'link')
+      if (e.shiftKey) emit('image-request')
+      else applyAction('link')
       break
     case 'l':
       if (e.shiftKey) {
@@ -243,7 +271,7 @@ function focus() {
   ta.value?.focus()
 }
 
-defineExpose({ applyAction, focus })
+defineExpose({ applyAction, focus, insertSnippet })
 
 watch(
   () => props.modelValue,
@@ -276,6 +304,7 @@ onBeforeUnmount(() => {
         autocomplete="off"
         @input="onInput"
         @keydown="onKeydown"
+        @paste="onPaste"
         @scroll="syncScroll"
         @click="updateCaret"
         @keyup="updateCaret"

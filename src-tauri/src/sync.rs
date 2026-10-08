@@ -1019,6 +1019,8 @@ pub async fn sync_down(
     // 键与落点是两回事，绝不能互相推导。
     let mut downloads: Vec<(String, PathBuf)> = Vec::new();
     let mut trash_candidates: Vec<(String, PathBuf)> = Vec::new(); // (guid, 本地旧落点)
+    // 增量索引用：zip 被重新落盘的篇（新增/内容更新/改落点/文件缺失重下）
+    let mut changed_guids: Vec<String> = Vec::new();
     for n in notes.values() {
         let dest = root.join(&n.exported_path);
         // 本地清单里 md5 已与远端一致且文件在 → 无需下载
@@ -1035,6 +1037,7 @@ pub async fn sync_down(
                 cfg.cloud_key(&format!("{KEY_NATIVE}/notes/{}", braced(&n.guid))),
                 dest.clone(),
             ));
+            changed_guids.push(n.guid.clone());
         }
         // 远端改了标题/目录（`exported_path` 变了）→ 本地旧落点是残留文件：同一个 guid 不能有
         // 两个文件，否则库自检按"文件不在清单里"报孤儿。移入回收站（可恢复），不直接删。
@@ -1052,10 +1055,13 @@ pub async fn sync_down(
         }
     }
     // 本地清单里有、远端清单里没有 → 远端（写入端）删了它 → 本地文件移入 `_trash`（Q8）
+    // 无论磁盘文件在不在，索引行都必须删（增量索引的「消失」集合）
+    let mut vanished_guids: Vec<String> = Vec::new();
     for (guid, p) in &lp.notes {
         if notes.contains_key(guid) || local_keep.contains(guid) {
             continue;
         }
+        vanished_guids.push(guid.clone());
         let old = root.join(&p.exported_path);
         if old.is_file() {
             trash_candidates.push((guid.clone(), old));
@@ -1162,22 +1168,75 @@ pub async fn sync_down(
         }
     }
 
-    // 4. **建库索引**（U3：不再合成 WIZ_* 兼容源索引）
+    // 4. **建库索引：增量优先，全量兜底**（U3：不再合成 WIZ_* 兼容源索引）
     //
-    // 旧链路是「合成一个 WIZ_* 形态的 index.db → build_index（源索引）」，现在 export.db
-    // 本身就是库索引的输入 ⇒ 少一个中间物、少一次全量合成，且索引落到**库索引**位置
-    // （`index-{hash8}.db`，§5.3）而不是源索引 `index.db`。只读端下行完即可浏览/检索。
+    // 索引落到**库索引**位置（`index-{hash8}.db`，§5.3）。旧做法每次下行都**全量重建**
+    // （O(全库)，每篇开 zip 抽正文喂 FTS），大库上「下行完等半天」。现改为只对**本次下行
+    // 实际变更的篇**做单篇增量（`update_library_note_index`：清单有行→重写、无行→删行，
+    // 与库内写路径共用同一条行写入），随后清掉「无笔记 ∧ 磁盘无目录」的残留 folder 行
+    // （删除/改名路径遗留）。三种情形直接全量：本地无旧清单（首次/引导，无从差分）、
+    // 索引文件缺失、本轮变更集为空。增量跑完自校验「索引篇数 == 清单篇数」，
+    // 不一致或中途失败一律**回退全量重建**（与旧行为一致，绝不留半套索引）。
     progress("index", 0, 1);
     let index_db = crate::config::index_file_for_library(root);
     let lib = root.to_path_buf();
-    let p = progress.clone();
-    crate::commands::spawn_blocking(move || -> Result<(), String> {
-        let resolver = Arc::new(crate::library::LibraryResolver::new(lib.clone())?);
-        crate::indexer::build_library_index(&lib, resolver, &index_db, &|d, t| p("index", d, t))
-            .map(|_| ())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let mut incr: Vec<String> = changed_guids;
+    incr.extend(vanished_guids);
+    incr.sort();
+    incr.dedup();
+    let use_incremental = local_prev.is_some() && index_db.is_file() && !incr.is_empty();
+    if !use_incremental {
+        let p = progress.clone();
+        crate::commands::spawn_blocking(move || -> Result<(), String> {
+            let resolver = Arc::new(crate::library::LibraryResolver::new(lib.clone())?);
+            crate::indexer::build_library_index(&lib, resolver, &index_db, &|d, t| p("index", d, t))
+                .map(|_| ())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    } else {
+        let lib_incr = lib.clone();
+        let index_incr = index_db.clone();
+        let p = progress.clone();
+        let res = crate::commands::spawn_blocking(move || -> Result<(), String> {
+            let resolver = Arc::new(crate::library::LibraryResolver::new(lib_incr.clone())?);
+            let total = incr.len();
+            for (i, g) in incr.iter().enumerate() {
+                crate::indexer::update_library_note_index(&lib_incr, resolver.clone(), &index_incr, g)
+                    .map_err(|e| format!("增量更新 {g}: {e}"))?;
+                p("index", i + 1, total);
+            }
+            crate::indexer::prune_stale_index_folders(&index_incr, &lib_incr)?;
+            // 自校验：增量漏一篇（无论多删还是漏更）都会在这里被拦下 → 回退全量
+            let idx_n: i64 = rusqlite::Connection::open_with_flags(
+                &index_incr,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|c| c.query_row("SELECT count(*) FROM note", [], |r| r.get::<_, i64>(0)))
+            .map_err(|e| e.to_string())?;
+            let man_n = resolver.note_count() as i64;
+            if idx_n != man_n {
+                return Err(format!("增量后索引篇数 {idx_n} ≠ 清单篇数 {man_n}"));
+            }
+            crate::commands::append_sync_log(&format!("下行索引增量更新完成：{total} 篇变更"));
+            Ok(())
+        })
+        .await;
+        if let Err(e) = res {
+            crate::commands::append_sync_log(&format!("下行增量索引更新失败，回退全量重建: {e}"));
+            let p2 = progress.clone();
+            crate::commands::spawn_blocking(move || -> Result<(), String> {
+                let resolver =
+                    Arc::new(crate::library::LibraryResolver::new(lib.clone())?);
+                crate::indexer::build_library_index(&lib, resolver, &index_db, &|d, t| {
+                    p2("index", d, t)
+                })
+                .map(|_| ())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        }
+    }
     progress("index", 1, 1);
 
     drop(conn);
@@ -1217,6 +1276,20 @@ pub async fn bootstrap_export(
              或把已有导出根设为数据目录）后再初始化"
                 .into(),
         );
+    }
+    // 【真云 GUI 实测发现（2026-09-20）】初始化 ≠ 普通上行：
+    // 闩全清的库（例如曾同步到旧远端、现把桶/前缀指向全新空远端）走 sync_up 会命中
+    // 「D==∅ ⇒ 不铸版不提交」早退分支 —— 云端零对象、却照样返回成功，
+    // `init_cloud_sync` 随即置 `initialized=true`（状态谎报：此后 down 必报
+    // SYNC_NO_MANIFEST、up 永远无动作，客户端卡死在"已初始化的空远端"上）。
+    // 初始化的语义是「把本库完整铸版为远端 rev1」⇒ 远端无清单时全库置脏再上行。
+    if fetch_remote_manifest(store, cfg, root).await?.is_none() {
+        let conn = manifest::open_and_migrate(root)?;
+        let n = manifest::mark_all_notes_dirty(&conn)?;
+        let a = manifest::mark_all_attachments_dirty(&conn)?;
+        crate::commands::append_sync_log(&format!(
+            "初始化：远端无清单，全库置脏（笔记 {n} 篇、附件 {a} 行）后全量铸版上行"
+        ));
     }
     sync_up(store, cfg, root, progress).await
 }
@@ -1797,6 +1870,154 @@ mod tests {
         // 无更新时第二次 down 直接返回（revision 相同）
         let rep_d2 = sync_down(&store, &cfg_r, &dst, p).await.unwrap();
         assert_eq!(rep_d2.direction, "none");
+    }
+
+    /// 下行**增量**索引更新：小变更下行不再全量重建，索引仍逐篇正确。
+    /// - 改动的篇：新正文进 FTS、旧正文退出；
+    /// - 被远端删除的篇：note/note_fts 行删除、「无笔记 ∧ 磁盘无目录」的 folder 行清理；
+    /// - 只下载改动篇（downloaded==1）本身也证明差集逻辑没变。
+    /// 首次下行全量建库索引由 roundtrip 用例覆盖；增量的安全网（篇数校验→回退全量）
+    /// 难以在不 hack 的情况下从外部触发，由自校验逻辑托底。
+    #[tokio::test]
+    async fn test_down_incremental_index_update() {
+        let _s = crate::library::test_write_lock(); // local_write/delete_note 走真实写路径
+        isolate_wiz_home();
+        let a = temp_root("incr-a");
+        let b = temp_root("incr-b");
+        let g1 = "11111111-2222-3333-4444-666666666666";
+        let g2 = "22222222-3333-4444-5555-777777777777";
+        seed_manifest(&a, g1, "<html><body>甲篇 蓝鲸甲</body></html>");
+        // 第二篇：不同落点（seed_manifest 只会写 docs/n.zip，手工铺）
+        {
+            let zip_path = a.join("docs").join("m.zip");
+            write_zip(&zip_path, "<html><body>乙篇 蓝鲸乙</body></html>");
+            let conn = manifest::open_and_migrate(&a).unwrap();
+            manifest::upsert_note(
+                &conn,
+                &manifest::ManifestNote {
+                    guid: g2.into(),
+                    title: "t2".into(),
+                    location: "/e/".into(),
+                    created: String::new(),
+                    data_modified: "2024-01-01".into(),
+                    url: None,
+                    doc_type: None,
+                    has_attachment: false,
+                    package_size: std::fs::metadata(&zip_path).unwrap().len() as i64,
+                    exported_path: "docs/m.zip".into(),
+                    exported_size: std::fs::metadata(&zip_path).unwrap().len() as i64,
+                    exported_md5: manifest::md5_file(&zip_path).unwrap(),
+                    export_mode: "native".into(),
+                    exported_at: "2026-09-17".into(),
+                    origin: crate::manifest::ORIGIN_WIZNOTE.into(),
+                    content_format: crate::manifest::FORMAT_HTML.into(),
+                },
+            )
+            .unwrap();
+            manifest::bump_note_revision(&conn, g2).unwrap();
+        }
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+
+        // B 首次下行 = 全量：2 篇全进索引
+        let cfg_b = cfg_of(&b);
+        sync_down(&store, &cfg_b, &b, p.clone()).await.unwrap();
+        let idx = crate::config::index_file_for_library(&b);
+        let count = |db: &Path| -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM note", [], |r| r.get(0))
+                .unwrap()
+        };
+        let fts = |db: &Path, kw: &str| -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM note_fts WHERE note_fts MATCH ?1",
+                    [kw],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(&idx), 2, "首次下行全量建索引");
+        assert_eq!(fts(&idx, "蓝鲸乙"), 1);
+
+        // A 走真实写路径：改一篇 + 删一篇 → 上行；B 二次下行 = **增量**路径
+        local_write(&a, g1, "<html><body>甲篇 改后蓝鲸丙</body></html>");
+        crate::library::delete_note(&a, &crate::config::index_file_for_library(&a), g2).unwrap();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        let d = sync_down(&store, &cfg_b, &b, p.clone()).await.unwrap();
+        assert_eq!(d.downloaded, 1, "只有改动的一篇需要重新下载");
+        assert!(d.failures.is_empty(), "{:?}", d.failures);
+
+        // 增量后索引与清单一致：g1 行换新正文、g2 行删除、空目录行清理
+        assert_eq!(count(&idx), 1, "被远端删除的篇必须出索引");
+        assert_eq!(fts(&idx, "蓝鲸丙"), 1, "改动的篇新正文可检索");
+        assert_eq!(fts(&idx, "蓝鲸甲"), 0, "旧正文必须退出 FTS");
+        assert_eq!(fts(&idx, "蓝鲸乙"), 0, "删除篇的正文必须退出 FTS");
+        assert!(
+            !b.join("docs").join("m.zip").is_file(),
+            "被远端删除的篇应移入 _trash"
+        );
+        let e_rows: i64 = rusqlite::Connection::open(&idx)
+            .unwrap()
+            .query_row("SELECT count(*) FROM folder WHERE path='/e/'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(e_rows, 0, "无笔记且磁盘无目录的 folder 行应被清理");
+        // 路径断言（变异检查用）：本轮下行必须**真的走了增量**且未回退。
+        // sync.log 由同进程全部测试共享，但「回退全量重建」字样只在增量失败时出现，
+        // 出现即真失败；「下行索引增量更新完成」任何走通增量的下行都会留下。
+        let log = std::fs::read_to_string(crate::config::wiz_home().join("sync.log"))
+            .unwrap_or_default();
+        assert!(
+            log.contains("下行索引增量更新完成"),
+            "二次下行应走增量路径: {log}"
+        );
+        assert!(!log.contains("回退全量重建"), "增量不得回退全量: {log}");
+    }
+
+    /// 【真云 GUI 实测发现（2026-09-20）】初始化 ≠ 普通上行：闩全清的库指向**全新空远端**时
+    /// （例如曾同步到旧远端的库，把桶/前缀改指新空远端后点「初始化」——真云 GUI 实测的
+    /// libGUI 正是这个状态），bootstrap_export 若直接转 sync_up 会命中「D==∅ ⇒ 不铸版
+    /// 不提交」早退 —— 云端零对象却成功返回，`init_cloud_sync` 随即置 `initialized=true`
+    /// （状态谎报：此后 down 必报 SYNC_NO_MANIFEST、up 永远无动作，客户端卡死）。
+    /// 修复语义：初始化 = 把本库完整铸版为远端 rev1 ⇒ 远端无清单时全库置脏再上行。
+    /// **变异检查**：删掉 bootstrap_export 里的置脏分支 → 本测试 uploaded=0 FAILED。
+    #[tokio::test]
+    async fn test_bootstrap_export_full_mint_on_clean_library_and_empty_remote() {
+        isolate_wiz_home();
+        let src = temp_root("boot-clean");
+        let guid = "11111111-2222-3333-4444-555555555555";
+        seed_manifest(&src, guid, "<html><body>迁移库</body></html>");
+        // 模拟「曾同步到旧远端」：闩全清、srev=1、本地水位=2（与真云实测的 libGUI 同构）
+        {
+            let c = manifest::open_and_migrate(&src).unwrap();
+            manifest::mark_notes_synced(&c, &[guid.to_string()], 1).unwrap();
+            manifest::set_meta(&c, "revision", "2").unwrap();
+        }
+        let cfg = cfg_of(&src);
+        let store = MemStore::new();
+        let rep = bootstrap_export(&store, &cfg, &src, noop_progress()).await.unwrap();
+        assert_eq!(rep.uploaded, 1, "闩全清的库初始化到空远端必须全量上行（修复前为 0）");
+        assert!(rep.manifest_uploaded, "必须铸版并提交清单");
+        assert_eq!(rep.remote_revision, None, "首次铸版本轮开始时远端尚无清单 ⇒ None");
+        assert!(rep.failures.is_empty(), "{:?}", rep.failures);
+        // 云端必须真的有清单对象（修复前 manifest.db 都不存在，initialized 却被置位）
+        let head = store
+            .head(&cfg.cloud_key("manifest.db"))
+            .await
+            .unwrap()
+            .expect("远端清单必须存在");
+        assert_eq!(
+            head.meta("revision").and_then(|v| v.parse::<u64>().ok()),
+            Some(3),
+            "铸版号从**本地水位**续（本地 rev2 ⇒ 首铸 rev3），不从 1 起（迁移库保留版本历史）"
+        );
+        // 对照：远端已有清单后再初始化 = 幂等空转（不得重复置脏、不得重复铸版）
+        let rep2 = bootstrap_export(&store, &cfg, &src, noop_progress()).await.unwrap();
+        assert_eq!(rep2.uploaded, 0, "远端已有清单且本地无闩 ⇒ 空转");
+        assert!(!rep2.manifest_uploaded, "空转不得提交清单");
     }
 
     /// 承重⑤（简单面）：远端内容已分叉、本地也改过 ⇒ **writer 冲突**。

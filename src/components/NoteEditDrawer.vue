@@ -19,10 +19,21 @@
  * 相对资源 `index_files/…` 照常从 zip 解析、CSP 与兼容层注入与阅读态完全一致，
  * 而草稿只在该 token 的请求上生效，不会污染普通阅读；md 草稿由后端渲染后返回。
  */
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { api, writeErrorText, type NoteWriteReport } from '../api'
 import MdSourceEditor from './MdSourceEditor.vue'
 import type { MdAction } from '../mdedit'
+import {
+  buildPastePayload,
+  bytesToBase64,
+  dataUriToBase64,
+  decidePaste,
+  extractDataUris,
+  imageSnippet,
+  attachmentSnippet,
+  replaceDataUris,
+  type PastePayload,
+} from '../noteimage'
 
 const props = defineProps<{ guid: string; title: string; location: string }>()
 const emit = defineEmits<{
@@ -45,6 +56,10 @@ const result = ref<NoteWriteReport | null>(null)
 /** 预览可见性：长文写作时"只看源码"能让编辑区宽一倍 */
 const showPreview = ref(true)
 const editor = ref<InstanceType<typeof MdSourceEditor> | null>(null)
+/** native 包的纯文本 textarea（html 形态没有专用编辑器，插图/粘贴直接操作它） */
+const nativeTa = ref<HTMLTextAreaElement | null>(null)
+/** 图片上传中（选图/粘贴共用；期间按钮置灰防重复入包） */
+const imgBusy = ref(false)
 let previewTimer: number | null = null
 
 const dirty = computed(() => src.value !== original.value)
@@ -119,7 +134,137 @@ function onInput() {
 }
 
 function act(action: MdAction) {
+  // M4：图片按钮不再是"敲语法骨架"，而是真的选一张图入包（⇧⌘K 在编辑器里同一条路）
+  if (action === 'image') {
+    void insertImageFromFile()
+    return
+  }
   editor.value?.applyAction(action)
+}
+
+// ---- M4 图片插入（文件选择器 / 粘贴，两条入口汇到这里） ----
+
+/** 系统对话框选图 → 后端读文件写入包内 index_files/ → 在光标处插入引用 */
+async function insertImageFromFile() {
+  if (imgBusy.value || loading.value || loadError.value) return
+  imgBusy.value = true
+  saveError.value = ''
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const sel = await open({
+      multiple: false,
+      title: '选择要插入的图片',
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] }],
+    })
+    if (typeof sel !== 'string' || !sel) return
+    const rep = await api.addNoteImageFile(props.guid, sel)
+    insertImageRef(rep.entry, rep.entry)
+  } catch (e) {
+    saveError.value = writeErrorText(e)
+  } finally {
+    imgBusy.value = false
+  }
+}
+
+/** M4 最小版：选任意文件作为附件入包（attachments/），正文插链接引用（md [名](…)；html <a>） */
+async function insertAttachmentFromFile() {
+  if (imgBusy.value || loading.value || loadError.value) return
+  imgBusy.value = true
+  saveError.value = ''
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const sel = await open({ multiple: false, title: '选择要插入的附件' })
+    if (typeof sel !== 'string' || !sel) return
+    const rep = await api.addNoteAttachment(props.guid, sel)
+    const name = sel.split('/').pop() || rep.entry
+    insertIntoBody(attachmentSnippet(rep.entry, name, isMd.value))
+  } catch (e) {
+    saveError.value = writeErrorText(e)
+  } finally {
+    imgBusy.value = false
+  }
+}
+
+/** 按 dt 入库返回的 entry 在光标处插入引用片段（md → ![]()；html → <img>） */
+function insertImageRef(entry: string, alt: string) {
+  const snippet = imageSnippet(entry, alt, isMd.value)
+  if (isMd.value) {
+    editor.value?.insertSnippet(snippet)
+  } else {
+    insertIntoTextarea(snippet)
+  }
+  onInput()
+}
+
+/** native 包 textarea 的光标插入（走 v-model 数据源；光标手动复位） */
+function insertIntoTextarea(snippet: string) {
+  const ta = nativeTa.value
+  const cur = src.value
+  const s = ta?.selectionStart ?? cur.length
+  const e = ta?.selectionEnd ?? s
+  src.value = cur.slice(0, s) + snippet + cur.slice(e)
+  const at = s + snippet.length
+  void nextTick(() => {
+    if (!ta) return
+    ta.focus()
+    ta.setSelectionRange(at, at)
+  })
+}
+
+/** 粘贴处理（md 编辑器 emit 过来 / native textarea 直呼）：有图就拦截入库 */
+async function onPasteImage(payload: PastePayload) {
+  const kind = decidePaste(payload)
+  if (kind === 'none' || imgBusy.value) return
+  imgBusy.value = true
+  saveError.value = ''
+  try {
+    if (kind === 'files') {
+      // 截图 / 复制的图片文件：逐张入包（一张失败不挡后续，错误都摆出来）
+      for (const f of payload.files) {
+        try {
+          const buf = await f.arrayBuffer()
+          const b64 = bytesToBase64(new Uint8Array(buf))
+          const rep = await api.addNoteImageData(props.guid, b64, f.name || null)
+          insertImageRef(rep.entry, f.name || rep.entry)
+        } catch (e) {
+          saveError.value = writeErrorText(e)
+        }
+      }
+      return
+    }
+    // 文本/富文本里的内嵌图（data: URI）：抽出入库 → 引用替换回正文
+    const raw = kind === 'text-data' ? payload.text : payload.html
+    const uris = extractDataUris(raw)
+    const map: Record<string, string> = {}
+    for (const uri of uris) {
+      try {
+        const rep = await api.addNoteImageData(props.guid, dataUriToBase64(uri), null)
+        map[uri] = rep.entry
+      } catch (e) {
+        saveError.value = writeErrorText(e)
+      }
+    }
+    if (Object.keys(map).length === 0) return
+    // 富文本来源没有纯文本可要（有也就没图了）→ 原样保留标记结构，只换图的地址
+    insertIntoBody(replaceDataUris(raw, map))
+  } finally {
+    imgBusy.value = false
+  }
+}
+
+/** 大段替换文本的插入入口（md 走编辑器保留撤销栈；html 走 textarea） */
+function insertIntoBody(text: string) {
+  if (isMd.value) editor.value?.insertSnippet(text)
+  else insertIntoTextarea(text)
+  onInput()
+}
+
+/** native textarea 的 paste 钩子（同步抽取 → 异步入库） */
+function onPasteNative(e: ClipboardEvent) {
+  const payload = buildPastePayload(e)
+  if (decidePaste(payload) === 'none') return
+  e.preventDefault()
+  void onPasteImage(payload)
 }
 
 async function save() {
@@ -151,6 +296,26 @@ async function close() {
   emit('close')
 }
 
+// ---- macOS 窗口红绿灯（编辑抽屉不是独立窗口，三个钮均落在抽屉头部最左）----
+// 红 = 关闭编辑器（与原「关闭」同一条路径，未保存会先确认）；
+// 黄 = 最小化主窗口；绿 = 最大化 / 还原主窗口（经 Tauri 窗口 API）。
+async function winMinimize() {
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    await getCurrentWindow().minimize()
+  } catch {
+    /* 非 Tauri 环境（纯浏览器 dev）忽略 */
+  }
+}
+async function winToggleMax() {
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    await getCurrentWindow().toggleMaximize()
+  } catch {
+    /* 非 Tauri 环境忽略 */
+  }
+}
+
 /** ⌘S 保存 / ⌘Enter 保存：编辑器不接管这两个键，抽屉统一收口 */
 function onKeydown(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && (e.key.toLowerCase() === 's' || e.key === 'Enter')) {
@@ -176,6 +341,12 @@ const saved = computed(() => result.value !== null && !saveError.value)
   <div class="drawer-backdrop" @click.self="close">
     <div class="drawer">
       <div class="drawer-head">
+        <!-- macOS 通用窗口按钮：关闭 / 最小化 / 最大化 -->
+        <div class="tl-group">
+          <button class="tl tl-close" title="关闭编辑器" @click="close"></button>
+          <button class="tl tl-min" title="最小化窗口" @click="winMinimize"></button>
+          <button class="tl tl-max" title="最大化 / 还原窗口" @click="winToggleMax"></button>
+        </div>
         <strong class="drawer-title" :title="title">编辑正文：{{ title }}</strong>
         <span class="drawer-loc" :title="location">{{ location }}</span>
         <span class="chip chip-fmt">{{ isMd ? 'Markdown' : 'HTML' }}</span>
@@ -198,11 +369,19 @@ const saved = computed(() => result.value !== null && !saveError.value)
           v-for="t in TOOLS"
           :key="t.act"
           class="tool"
-          :title="t.hint"
-          :disabled="saving"
+          :title="t.act === 'image' ? '插入图片（⇧⌘K）：选择图片文件写入笔记包' : t.hint"
+          :disabled="saving || imgBusy"
           @click="act(t.act)"
         >
-          {{ t.label }}
+          {{ t.act === 'image' && imgBusy ? '…' : t.label }}
+        </button>
+        <button
+          class="tool"
+          title="插入附件：选择任意文件写入笔记包 attachments/，正文插入链接（上限 50 MB）"
+          :disabled="saving || imgBusy"
+          @click="insertAttachmentFromFile"
+        >
+          📎
         </button>
         <span class="spacer"></span>
         <span class="tool-hint">
@@ -218,15 +397,24 @@ const saved = computed(() => result.value !== null && !saveError.value)
           <div class="pane-head">
             {{ sourceLabel }}（可直接改；保存前会校验空正文与宿主引用）
           </div>
-          <!-- md 包：专用源码编辑器（高亮 + 编辑辅助） -->
-          <MdSourceEditor v-if="isMd" ref="editor" v-model="src" @input="onInput" />
-          <!-- native 包：纯文本编辑，不做 HTML 语法辅助 -->
+          <!-- md 包：专用源码编辑器（高亮 + 编辑辅助）；插图/粘贴有图 → 抽屉统一上传 -->
+          <MdSourceEditor
+            v-if="isMd"
+            ref="editor"
+            v-model="src"
+            @input="onInput"
+            @paste-image="onPasteImage"
+            @image-request="insertImageFromFile"
+          />
+          <!-- native 包：纯文本编辑，不做 HTML 语法辅助；粘贴有图同样入包 -->
           <textarea
             v-else
+            ref="nativeTa"
             v-model="src"
             class="src"
             spellcheck="false"
             @input="onInput"
+            @paste="onPasteNative"
           ></textarea>
         </div>
         <div v-if="showPreview" class="pane">
@@ -248,8 +436,9 @@ const saved = computed(() => result.value !== null && !saveError.value)
         </ul>
       </div>
       <div class="drawer-foot">
-        提示：只替换 zip 内 <code>{{ entryName }}</code>，其余条目（<code>index_files/</code>、
-        <code>attachments/</code>）原样保留；保存即更新清单 MD5 / 体积 / 修订号。
+        提示：保存只替换 zip 内 <code>{{ entryName }}</code>；插入图片会追加进包内
+        <code>index_files/</code>，插入附件（📎）会追加进 <code>attachments/</code>
+        并在正文插链接（均用相对路径引用，清单 MD5 / 体积 / 修订号随之更新）。
         <span v-if="isMd">编辑器只插入你按下的字符，不做任何自动整理。</span>
       </div>
     </div>
@@ -284,6 +473,60 @@ const saved = computed(() => result.value !== null && !saveError.value)
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
+}
+/* macOS 红绿灯：红=关编辑器，黄=最小化窗口，绿=最大化/还原窗口；悬停整组时显示符号 */
+.tl-group {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 4px;
+}
+.tl {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  position: relative;
+  flex: none;
+}
+.tl-close {
+  background: #ff5f57;
+}
+.tl-min {
+  background: #febc2e;
+}
+.tl-max {
+  background: #28c840;
+}
+.tl::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 1;
+  color: rgba(0, 0, 0, 0.55);
+  opacity: 0;
+}
+.tl-group:hover .tl::after {
+  opacity: 1;
+}
+.tl-close::after {
+  content: '×';
+}
+.tl-min::after {
+  content: '−';
+}
+.tl-max::after {
+  content: '+';
+}
+.tl:active {
+  filter: brightness(0.9);
 }
 .drawer-title {
   font-size: 14px;

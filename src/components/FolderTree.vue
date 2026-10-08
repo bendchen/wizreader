@@ -11,6 +11,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'select', path: string): void
   (e: 'drop-note', path: string): void
+  (e: 'create-folder'): void
 }>()
 
 const tree = ref<TreeNode[]>([])
@@ -67,7 +68,18 @@ onMounted(() => {
 
 <template>
   <div class="panel panel-tree">
-    <div class="panel-head">目录</div>
+    <div class="panel-head">
+      目录
+      <span style="flex: 1"></span>
+      <button
+        v-if="droppable"
+        class="mini-btn"
+        title="在当前选中目录下新建目录"
+        @click="emit('create-folder')"
+      >
+        ＋ 目录
+      </button>
+    </div>
     <div class="tree-scroll tree-node">
       <div v-if="loading" class="empty-hint">加载中…</div>
       <template v-else>
@@ -117,6 +129,11 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.mini-btn {
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+}
 .tree-row.drop-over {
   background: rgba(22, 119, 255, 0.18);
   outline: 1px dashed #1677ff;

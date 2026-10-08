@@ -372,6 +372,9 @@ pub fn run() {
             commands::rename_note_cmd,
             commands::move_note_cmd,
             commands::delete_note_cmd,
+            // 空库初始化 + 库内新建目录（空态页「新建笔记/新建目录」）
+            commands::init_library_manifest,
+            commands::create_folder_cmd,
             // 笔记库编辑（FR-11 P2 / S2）：读正文源码 + 预览草稿
             commands::get_note_source,
             commands::get_note_file_path,
@@ -379,6 +382,11 @@ pub fn run() {
             commands::clear_note_draft,
             // 正文写（§4.3）：按包内形态自动分派（md 包 → note.md；native → index.html）
             commands::save_note_source_cmd,
+            // M4 图片插入：包内 index_files/ 追加条目（文件选择器 / 粘贴两条入口）
+            commands::add_note_image_file_cmd,
+            commands::add_note_image_data_cmd,
+            // M4 附件插入（最小版）：包内 attachments/ 追加任意文件，正文插链接
+            commands::add_note_attachment_cmd,
             // 云同步（阶段二 FR-07）
             commands::get_sync_config,
             commands::test_cloud_connection,
