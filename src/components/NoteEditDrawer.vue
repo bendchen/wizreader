@@ -65,8 +65,6 @@ let previewTimer: number | null = null
 const dirty = computed(() => src.value !== original.value)
 const previewStale = computed(() => !token.value)
 const isMd = computed(() => format.value === 'md')
-/** 包内正文档名（标签与页脚共用，避免两处各写一份） */
-const entryName = computed(() => (isMd.value ? 'note.md' : 'index.html'))
 const sourceLabel = computed(() =>
   isMd.value ? 'Markdown 源码（note.md）' : 'HTML 源码（index.html）'
 )
@@ -435,12 +433,6 @@ const saved = computed(() => result.value !== null && !saveError.value)
           <li v-for="(w, i) in result.warnings" :key="i">{{ w }}</li>
         </ul>
       </div>
-      <div class="drawer-foot">
-        提示：保存只替换 zip 内 <code>{{ entryName }}</code>；插入图片会追加进包内
-        <code>index_files/</code>，插入附件（📎）会追加进 <code>attachments/</code>
-        并在正文插链接（均用相对路径引用，清单 MD5 / 体积 / 修订号随之更新）。
-        <span v-if="isMd">编辑器只插入你按下的字符，不做任何自动整理。</span>
-      </div>
     </div>
   </div>
 </template>
@@ -665,12 +657,5 @@ const saved = computed(() => result.value !== null && !saveError.value)
 .warn-list {
   margin: 6px 0 0;
   padding-left: 18px;
-}
-.drawer-foot {
-  flex: none;
-  padding: 8px 12px;
-  border-top: 1px solid var(--border);
-  font-size: 11.5px;
-  color: var(--text-2);
 }
 </style>
