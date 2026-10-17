@@ -14,6 +14,7 @@
 | `S4 对象级 412` | D2 跳过单篇（M5） | 只该篇不上行（其余照常提交）、该篇云端字节不变、闩保持、下一轮补上 |
 | `S5 If-Match 方言` | Ceph 去引号适配 | 引号形式 412 → 去引号重试成功；调用方**看不到** 412（`retried==0`） |
 | `S6 附件下行云端胜` | D5 | md5 分歧 ⇒ 覆盖本地且**真的发了 GET**；md5 相同 ⇒ **一个 GET 都不发** |
+| `S7 真云双 writer` | 真云复跑（§6 第 1 项） | 独立前缀下 A 上行 → B 上行（对齐）→ A 再上行（再对齐）；`put_bytes_if` / `put_file_if` 在真 Ceph 上都走通；双端 `--deep` 全绿；跑完清空前缀 |
 
 夹具（`/tmp` 内，源只读）
 ------------------------
@@ -23,9 +24,13 @@ S6 的附件行是**合成注入**的（CLI 导出路径产 0 附件行），只
 
 用法
 ----
-    python3 tools/tests/lww_e2e.py                 # 全部场景
+    python3 tools/tests/lww_e2e.py                 # 全部替身场景
     python3 tools/tests/lww_e2e.py --only S2,S3    # 单跑
     python3 tools/tests/lww_e2e.py --keep          # 保留 /tmp/wiz-lww-e2e 供排查
+    python3 tools/tests/lww_e2e.py --real-cloud --ak 123456 --sk 12342234   # S7 真云（Ceph）
+
+⚠ 真云模式**必须**给独立前缀（默认 `lww-e2e-<时间戳>`）：bucket 根就是用户正在用的
+主云端数据（`manifest.db` + `native/…`），空前缀等于拿主库做实验。
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打印）。
 """
@@ -42,6 +47,7 @@ import subprocess
 import sys
 import time
 import traceback
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -54,6 +60,7 @@ DEFAULT_SOURCE = os.path.expanduser("~/.wiznote/boy2eye@126.com/data")
 DEFAULT_INDEX_DIR = os.path.expanduser("~/.wizreader")
 DEFAULT_FOLDER = "/boraydata/rdma-socket/"  # 69 篇、无附件、体积 ~1.6 MB
 SECRET = "lww-e2e-secret"
+REAL: dict = {}  # `--real-cloud` 时填充（endpoint/bucket/prefix/ak/sk）；S7 专用
 
 RE_UP = re.compile(
     r"上传 (\d+) / 跳过 (\d+) / 超限 (\d+) / 冲突留存 (\d+) / 对齐重试 (\d+) / 覆盖远端版 (\d+)"
@@ -117,21 +124,37 @@ class Bench:
 
 
 class Machine:
-    """一台"机器" = 一个库 + 一个隔离 `WIZREADER_HOME` + 一份 settings.json。"""
+    """一台"机器" = 一个库 + 一个隔离 `WIZREADER_HOME` + 一份 settings.json。
 
-    def __init__(self, bench: Bench, work: str, name: str, port: int, role: str):
+    `cloud=None` ⇒ 指向本机替身（`127.0.0.1:{port}`，凭据走假 secret）；
+    `cloud=dict(endpoint,bucket,prefix,ak,sk)` ⇒ 指向**真云**（S7 专用；凭据仍走
+    `WIZREADER_SYNC_SECRET` 环境变量，绝不落盘到 settings.json）。
+    """
+
+    def __init__(
+        self, bench: Bench, work: str, name: str, port: int = 0, role: str = "writer",
+        cloud: dict | None = None,
+    ):
         self.bench = bench
         self.name = name
         self.lib = os.path.join(work, name, "lib")
         self.home = os.path.join(work, name, "home")
         os.makedirs(self.home, exist_ok=True)
         self.port = port
+        self.cloud = cloud
         self.role = role
         self.write_settings(role)
 
     # ---- 设置 ----
     def write_settings(self, role: str) -> None:
         self.role = role
+        # 真云模式下 prefix 必须是**本次一次性前缀**：bucket 根就是用户在用主云端数据
+        if self.cloud:
+            ep, bucket = self.cloud["endpoint"], self.cloud["bucket"]
+            prefix, ak = self.cloud["prefix"], self.cloud["ak"]
+            cred_user = "lww-e2e"
+        else:
+            ep, bucket, prefix, ak, cred_user = f"http://127.0.0.1:{self.port}", "wiz", "", "e2e", "e2e"
         s = {
             "library_dir": self.lib,
             "font_size": 16,
@@ -142,13 +165,13 @@ class Machine:
                 "enabled": True,
                 "role": role,
                 "local_root": "",
-                "endpoint": f"http://127.0.0.1:{self.port}",
-                "bucket": "wiz",
-                "prefix": "",
+                "endpoint": ep,
+                "bucket": bucket,
+                "prefix": prefix,
                 "region": "us-east-1",
                 "path_style": True,
-                "access_key_id": "e2e",
-                "credential_user": "e2e",
+                "access_key_id": ak,
+                "credential_user": cred_user,
                 "concurrency": 4,
                 "auto_check_on_start": False,
                 "initialized": True,
@@ -166,7 +189,7 @@ class Machine:
     def env(self) -> dict:
         e = dict(os.environ)
         e["WIZREADER_HOME"] = self.home
-        e["WIZREADER_SYNC_SECRET"] = SECRET
+        e["WIZREADER_SYNC_SECRET"] = self.cloud["sk"] if self.cloud else SECRET
         return e
 
     def run(self, *args: str, expect_rc: int = 0) -> subprocess.CompletedProcess:
@@ -249,6 +272,142 @@ class Machine:
 
     def conflict_path(self, guid: str, rev: int) -> str:
         return os.path.join(self.lib, "_conflicts", f"{guid}_{rev}.zip")
+
+
+class RealCloud:
+    """真云端的最小操作集（S7 断言用）。
+
+    为什么用 `curl --aws-sigv4` 而不是 boto3：本机没装 boto3，而 curl 8.7.1 自带 SigV4 签名，
+    这样驱动脚本**零第三方依赖**，且读的是"别人（我自己）写的同一个对象"，不经客户端代码 ——
+    证据口径与产品代码解耦（2026-09-20 那次方言结论就是用 boto3 独立复核出来的，同理）。
+    """
+
+    def __init__(self, endpoint: str, bucket: str, prefix: str, ak: str, sk: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+        self.ak = ak
+        self.sk = sk
+
+    # ---- 底层 ----
+    @property
+    def _sig(self) -> list[str]:
+        return ["--aws-sigv4", "aws:amz:us-east-1:s3", "-u", f"{self.ak}:{self.sk}"]
+
+    def _url(self, key: str) -> str:
+        # ⚠️ 必须百分号编码路径：curl 的 SigV4 **不**对 `{`/`}` 编码，而 Ceph 用编码后的
+        # canonical URI 验签 ⇒ 直接塞裸花括号会被判 `SignatureDoesNotMatch`(403)。
+        # 编码后 `%7B…%7D` 验签通过、Ceph 解码后落的键仍是 `{GUID}`（已实测）。
+        return f"{self.endpoint}/{self.bucket}/{quote(key, safe='/~')}"
+
+    def _req(self, method: str, key: str = "", data: bytes | None = None,
+             headers: tuple[str, ...] = ()) -> tuple[int, bytes]:
+        # ⚠️ `-g`：笔记对象键是 `native/notes/{GUID}`，花括号会被 curl 当 URL 通配符展开
+        # （`{a,b}` → 多个 URL）⇒ 不加就 GET 不到对象、md5 恒为 None。
+        cmd = ["curl", "-s", "-g", "--max-time", "120"]
+        # ⚠️ HEAD 必须用 `-I`：`-X HEAD` 时 curl 仍按 Content-Length 等 body ⇒ 挂到超时。
+        if method == "HEAD":
+            cmd += ["-I"]
+        else:
+            cmd += ["-o", "-", "-X", method]
+        cmd += ["-w", "\n%{http_code}", *self._sig, self._url(key)]
+        for h in headers:
+            cmd += ["-H", h]
+        if data is not None:
+            cmd += ["--data-binary", "@-"]
+        p = subprocess.run(cmd, input=data, capture_output=True)
+        # `-w "\n%{http_code}"` ⇒ 最后一段是状态码，前面才是 body/headers
+        body, _, code = p.stdout.rpartition(b"\n")
+        return int(code or 0), body
+
+    # ---- 对象操作 ----
+    def get(self, key: str) -> bytes | None:
+        code, body = self._req("GET", key)
+        return body if code == 200 else None
+
+    def md5(self, key: str) -> str | None:
+        b = self.get(key)
+        return md5_bytes(b) if b is not None else None
+
+    def list(self) -> list[str]:
+        """本前缀下的全部键（ListObjectsV2，最多 1000 个，够用）。"""
+        p = subprocess.run(
+            ["curl", "-s", *self._sig, "-G",
+             "--data-urlencode", "list-type=2",
+             "--data-urlencode", f"prefix={self.prefix + '/' if self.prefix else ''}",
+             f"{self.endpoint}/{self.bucket}/"],
+            capture_output=True, text=True,
+        )
+        return [m for m in re.findall(r"<Key>(.*?)</Key>", p.stdout)]
+
+    def delete(self, key: str) -> int:
+        return self._req("DELETE", key)[0]
+
+    def purge(self) -> tuple[int, int]:
+        """清空本前缀；返回 `(删除数, 剩余数)`。
+
+        **必须复查剩余**：DELETE 会因键编码/权限静默失败（踩过 —— 花括号键验签 403 时
+        `curl -s` 不看状态码，脚本以为删干净了，云端留了两个前缀的 70 个对象）。
+        """
+        keys = self.list()
+        for k in keys:
+            self.delete(k)
+        return len(keys), len(self.list())
+
+    def revision(self) -> int:
+        """读云端清单的 `meta.revision`（不落本地，用内存临时文件只读打开）。"""
+        data = self.get(self.key("manifest.db"))
+        if not data:
+            return 0
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            f.write(data)
+            tmp = f.name
+        try:
+            c = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            try:
+                row = c.execute("select value from meta where key='revision'").fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                c.close()
+        finally:
+            os.unlink(tmp)
+
+    def key(self, rel: str) -> str:
+        return f"{self.prefix}/{rel}" if self.prefix else rel
+
+    def note_key(self, guid: str) -> str:
+        return self.key(note_key(guid))
+
+    # ---- If-Match 方言探针（独立于客户端代码） ----
+    def probe_dialect(self) -> dict:
+        """直接问 Ceph：`If-Match` 带引号 vs 不带引号哪个被认。
+
+        判据是**写入是否真的发生**（GET 回的字节），而不只是看状态码 ——
+        只看 200 会被"服务端忽略条件头直接写"骗过去。
+        """
+        k = self.key("_probe/obj.bin")
+        v1, v2 = b"probe-v1\n", b"probe-v2\n"
+        self._req("PUT", k, data=v1)
+        code, head = self._req("HEAD", k)
+        etag = ""
+        m = re.search(rb"(?im)^etag:\s*\"?([0-9a-f]{32})\"?", head)
+        if m:
+            etag = m.group(1).decode()
+        quoted = self._req("PUT", k, data=v2, headers=(f'If-Match: "{etag}"',))[0]
+        quoted_wrote = self.md5(k) == md5_bytes(v2)
+        if quoted_wrote:  # 已写进 v2，复位成 v1 再测去引号形式
+            self._req("PUT", k, data=v1)
+        unquoted = self._req("PUT", k, data=v2, headers=(f"If-Match: {etag}",))[0]
+        unquoted_wrote = self.md5(k) == md5_bytes(v2)
+        wrong_q = self._req("PUT", k, data=v1, headers=('If-Match: "00000000000000000000000000000000"',))[0]
+        wrong_u = self._req("PUT", k, data=v1, headers=("If-Match: 00000000000000000000000000000000",))[0]
+        self.delete(k)
+        return {
+            "etag": etag, "quoted_status": quoted, "quoted_wrote": quoted_wrote,
+            "unquoted_status": unquoted, "unquoted_wrote": unquoted_wrote,
+            "wrong_quoted": wrong_q, "wrong_unquoted": wrong_u,
+        }
 
 
 def parse_up(stdout: str) -> dict:
@@ -673,6 +832,154 @@ def s6_attachment_down(bench: Bench, work: str, base: str) -> None:
         httpd.shutdown()
 
 
+def s7_real_cloud(bench: Bench, work: str, base: str) -> None:
+    """真云复跑（`docs/版本3-结论.md` §6 第 1 项）：A 上行 → B 上行（自动对齐）→ A 再上行。
+
+    与 S1 的差别只在"云端是真的"：因此多两件事 ——
+    ① 跑前用独立前缀做**环境探针**（`If-Match` 方言 + 错误 ETag 必须 412）；
+    ② 断言对象用 curl 独立读云端（不经产品代码），跑完清空本前缀。
+    """
+    cloud = REAL
+    if not cloud:
+        print("⚠ S7 需要真云配置（--real-cloud --ak/--sk），本轮跳过")
+        return
+    bench.section(
+        f"S7 真云双 writer（{cloud['endpoint']} / {cloud['bucket']} / 前缀 {cloud['prefix']}）"
+    )
+    real = RealCloud(**cloud)
+    n_purged, n_left = real.purge()
+    print(f"  预清理：删除本前缀下 {n_purged} 个残留对象（剩 {n_left}）")
+    bench.check("预清理：前缀确实已空（有残留 ⇒ 上次清理失败，别在脏云端上跑）", n_left == 0, f"剩 {n_left}")
+    w = os.path.join(work, "s7")
+    shutil.rmtree(w, ignore_errors=True)
+    os.makedirs(w, exist_ok=True)
+    try:
+        # ---- 0. 环境探针：直接问 Ceph，不经产品代码 ----
+        d = real.probe_dialect()
+        bench.check(
+            "环境：Ceph 支持条件写（不是 501/405）",
+            d["quoted_status"] in (200, 412) and d["unquoted_status"] in (200, 412),
+            f"引号→{d['quoted_status']} 去引号→{d['unquoted_status']}",
+        )
+        bench.check(
+            "安全底线：错误 ETag 两种形式都必须 412（不误放行）",
+            d["wrong_quoted"] == 412 and d["wrong_unquoted"] == 412,
+            f"引号={d['wrong_quoted']} 去引号={d['wrong_unquoted']}",
+        )
+        if d["quoted_status"] == 412 and d["unquoted_wrote"]:
+            dialect = "unquoted（引号形式被拒、去引号生效 ⇒ 适配层仍必需）"
+        elif d["quoted_wrote"]:
+            dialect = "rfc（引号形式直接生效 ⇒ 适配层已非必需，可简化）"
+        else:
+            dialect = "未定（两种形式都没写进去，需人工看）"
+        bench.check("记录：Ceph 的 If-Match 方言（2026-09-20 结论是否仍成立）", True, dialect)
+        bench.check(
+            "去引号形式的写入**真的发生了**（不是只回 200）",
+            d["unquoted_wrote"],
+            f"quoted_wrote={d['quoted_wrote']}",
+        )
+
+        # ---- 1. A 初始化上行（writer，空远端） ----
+        A = Machine(bench, w, "A", role="writer", cloud=cloud)
+        A.clone_from(base)
+        n = A.note_count()
+        rep = parse_up(A.cloud_init("writer").stdout)
+        bench.eq(f"A 初始化上行 {n} 篇", rep.get("uploaded"), n)
+        bench.eq("云端清单 revision == 1", real.revision(), 1)
+        keys = real.list()
+        bench.eq("云端对象数 = 篇数 + 清单", len(keys), n + 1)
+        bench.check(
+            "前缀隔离：所有键都在本前缀下（没碰 bucket 根的既有数据）",
+            all(k.startswith(cloud["prefix"] + "/") for k in keys),
+            str(keys[:3]),
+        )
+        bench.check(
+            "云端清单字节 == A 本地清单（put_bytes_if 首传）",
+            real.md5(real.key("manifest.db")) == md5_bytes(A.manifest_bytes()),
+        )
+
+        # ---- 2. B 以 reader 全量下行 ----
+        B = Machine(bench, w, "B", role="reader", cloud=cloud)
+        p = B.cloud_init("reader")
+        bench.eq("B 全量下行篇数", parse_down(p.stdout).get("downloaded"), n)
+        bench.eq("B 清单 revision 对齐云端", B.rev(), 1)
+
+        note1, _ = pick_notes(A, 2)
+        # ---- 3. A 改一篇 → 上行 rev2（清单走条件 PUT） ----
+        A.save_note(note1, edit_text("A-real-1"), "A1")
+        rep = parse_up(A.up().stdout)
+        bench.eq("A 上行只传 1 篇", rep.get("uploaded"), 1)
+        bench.eq("A 上行无对齐重试（远端没动过）", rep.get("retried"), 0)
+        bench.eq("云端 rev → 2", real.revision(), 2)
+        a_ver = real.md5(real.note_key(note1))
+        bench.check("云端 note1 == A 的 zip 字节", a_ver == A.note_md5(note1), str(a_ver))
+        bench.check(
+            "云端清单字节 == A 本地清单（put_bytes_if 条件提交在 Ceph 上生效）",
+            real.md5(real.key("manifest.db")) == md5_bytes(A.manifest_bytes()),
+        )
+
+        # ---- 4. B 改同一篇（基线 rev1）→ 撞 STALE → 对齐 → 风险篇条件覆盖 put_file_if ----
+        B.write_settings("writer")
+        B.save_note(note1, edit_text("B-real-1"), "B1")
+        off = B.log_size()
+        rep = parse_up(B.up().stdout)
+        log = B.log_since(off)
+        bench.eq("B 撞 STALE ⇒ 对齐重试 1 次", rep.get("retried"), 1)
+        bench.check("sync.log 记了「提交未命中，下行对齐后重试」", "提交未命中，下行对齐后重试" in log)
+        bench.eq("B 覆盖远端版 1 篇（走 put_file_if）", rep.get("overwritten_remote"), 1)
+        bench.check(
+            "没有降级成无条件 PUT（sync.log 无「条件 PUT 不可用」）",
+            "条件 PUT 不可用" not in log, log.strip()[-200:],
+        )
+        bench.eq("云端 rev → 3（提交者即最后写入者）", real.revision(), 3)
+        b_ver = B.note_md5(note1)
+        bench.check(
+            "云端 note1 == B 的 zip 字节（put_file_if 的 If-Match 在 Ceph 上走通）",
+            real.md5(real.note_key(note1)) == b_ver,
+        )
+        cp = B.conflict_path(note1, 2)
+        bench.check(
+            "B 旁置了 A 那一版（{guid}_2.zip == A 的字节）",
+            os.path.exists(cp) and md5_file(cp) == a_ver, cp,
+        )
+        bench.eq("B 的闩已清零", B.latch(note1), (0, 0))
+
+        # ---- 5. A 不先下行，直接再改同一篇 → 再撞 STALE → 再对齐 → 再覆盖（第二轮往返） ----
+        A.save_note(note1, edit_text("A-real-2"), "A2")
+        off = A.log_size()
+        rep = parse_up(A.up().stdout)
+        log = A.log_since(off)
+        bench.eq("A 再上行：对齐重试 1 次", rep.get("retried"), 1)
+        bench.check("A 的 sync.log 也记了固定措辞", "提交未命中，下行对齐后重试" in log)
+        bench.eq("A 再覆盖远端版 1 篇", rep.get("overwritten_remote"), 1)
+        bench.eq("云端 rev → 4", real.revision(), 4)
+        a2_ver = A.note_md5(note1)
+        bench.check("云端 note1 == A 第二版字节", real.md5(real.note_key(note1)) == a2_ver)
+        cpa = A.conflict_path(note1, 3)
+        bench.check(
+            "A 旁置了 B 那一版（{guid}_3.zip == B 的字节）",
+            os.path.exists(cpa) and md5_file(cpa) == b_ver, cpa,
+        )
+
+        # ---- 6. B 下行收敛 + 双端深度自检 ----
+        p = B.down()
+        bench.eq("B 下行拉到 1 篇", parse_down(p.stdout).get("downloaded"), 1)
+        bench.check("B 内容 == A 第二版", B.note_md5(note1) == a2_ver)
+        bench.eq("B 清单对齐 rev4", B.rev(), 4)
+        bench.eq("A 库深度自检（--deep）", A.verify_deep().returncode, 0)
+        bench.eq("B 库深度自检（--deep）", B.verify_deep().returncode, 0)
+        bench.eq("云端对象数仍是 篇数 + 1（没留孤儿）", len(real.list()), n + 1)
+        bench.check(
+            "终态：云端清单字节 == A 本地清单",
+            real.md5(real.key("manifest.db")) == md5_bytes(A.manifest_bytes()),
+        )
+    finally:
+        removed, left = real.purge()
+        print(f"  清理：删除本前缀下 {removed} 个对象（剩 {left}；bucket 根的既有数据未动）")
+        if left:
+            print(f"  ⚠️ 清理不干净：前缀 {cloud['prefix']} 下仍剩 {left} 个对象，需手工删")
+
+
 SCENARIOS = {
     "S1": s1_two_writers,
     "S2": s2_manifest_412,
@@ -680,6 +987,7 @@ SCENARIOS = {
     "S4": s4_object_412,
     "S5": s5_if_match_dialect,
     "S6": s6_attachment_down,
+    "S7": s7_real_cloud,
 }
 
 
@@ -722,8 +1030,30 @@ def main() -> int:
     ap.add_argument("--only", default="")
     ap.add_argument("--rebuild-base", action="store_true")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--real-cloud", action="store_true",
+                    help="跑 S7：对着真云（默认 Ceph 192.168.30.25:7480）做双 writer 往返")
+    ap.add_argument("--endpoint", default="http://192.168.30.25:7480")
+    ap.add_argument("--bucket", default="wiz")
+    ap.add_argument("--prefix", default="", help="默认 lww-e2e-<时间戳>；**不许为空**")
+    ap.add_argument("--ak", default="")
+    ap.add_argument("--sk", default="")
     args = ap.parse_args()
     args.base_lib = args.base_lib or os.path.join(args.work, "base-lib")
+
+    if args.real_cloud:
+        if not (args.ak and args.sk):
+            print("❌ 真云模式需要 --ak/--sk（凭据只进进程环境 + settings，不写脚本）")
+            return 1
+        prefix = (args.prefix or time.strftime("lww-e2e-%Y%m%d-%H%M%S")).strip("/")
+        if not prefix:
+            # bucket 根就是用户正在用的主云端数据（manifest.db + native/…），默认可写等于灾难
+            print("❌ 真云模式拒绝空前缀：bucket 根是用户主云端数据，必须给独立前缀")
+            return 1
+        REAL.update(endpoint=args.endpoint, bucket=args.bucket, prefix=prefix,
+                    ak=args.ak, sk=args.sk)
+        print(f"真云目标：{args.endpoint}/{args.bucket}/{prefix}（跑完清空本前缀）")
+        if not args.only:
+            args.only = "S7"  # 没点名就跑 S7，别混着跑替身场景浪费时间
 
     if not os.path.isfile(args.cli):
         print(f"❌ 找不到 wiz-cli：{args.cli}（先在 src-tauri 下 cargo build --release -p wiz-cli）")

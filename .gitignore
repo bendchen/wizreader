@@ -39,3 +39,7 @@ src-tauri/gen/schemas
 tools/gui/wizact
 tools/gui/winlist
 tools/gui/tis
+
+# Python 验收脚本的字节码缓存
+__pycache__/
+*.pyc
