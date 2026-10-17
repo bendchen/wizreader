@@ -1298,7 +1298,7 @@ pub async fn export_folder_cmd(
 }
 
 /// 每份笔记导出为一个 zip（FR-08.1 批量形态）。**D0**：只产 native（源 zip 字节级拷贝），
-/// 无模式参数（slim 已整体取消，见 `docs/本地笔记读写实现.md` §4.6）。
+/// 无模式参数（slim 已整体取消，见 `docs/版本1.md·第三篇` §4.6）。
 /// 耗时可能数分钟，放到 blocking 线程池，避免冻结界面
 #[tauri::command]
 pub async fn export_folder_zips_cmd(

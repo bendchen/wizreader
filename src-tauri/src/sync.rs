@@ -1,4 +1,4 @@
-//! 云同步编排层（**判据口径 = `docs/云同步逻辑.md` v1.0 定稿**；实现文档 §26）
+//! 云同步编排层（**判据口径 = `docs/版本2.md·第一篇` v1.0 定稿**；实现文档 §26）
 //!
 //! **v6 的口径（蓝本 = 为知笔记实测同步模型）**：
 //! **版本号只在"上行提交"时由唯一铸版者铸造；本地改动只置"脏闩"，绝不铸版。**
@@ -60,7 +60,7 @@ use crate::store::{
 /// `_trash/` 保留期（§6.4，做成常量便于测试注入）
 pub const TRASH_RETENTION_DAYS: u64 = 30;
 
-/// `_conflicts/` 保留期（v6，`docs/云同步逻辑.md` §7 第 5 条）：与 `_trash/` 同为 30 天。
+/// `_conflicts/` 保留期（v6，`docs/版本2.md·第一篇` §7 第 5 条）：与 `_trash/` 同为 30 天。
 /// 挂启动任务，每次启动扫一遍删超期留档。**窗口的意义**：留档是"被淘汰那一版"的唯一副本，
 /// 在云端 LWW 裁决（§11）建成前，它是唯一的安全网。
 pub const CONFLICT_RETENTION_DAYS: u64 = 30;
@@ -99,8 +99,8 @@ pub const ERR_OBJECT_PRECONDITION_FAILED: &str = "SYNC_OBJECT_PRECONDITION_FAILE
 /// ② 只读端**不再阻断**下行（2026-09-19 用户裁定：本地只读、云端改了就直接下载更新）。
 ///
 /// 保留常量只为**文档可比对**（升级前写下的老库键会残留，代码不再读它）；
-/// `docs/云同步逻辑.md` §8 作废清单第 1 条。
-#[deprecated(note = "v6 废止：改用脏闩，且只读端不再阻断下行（见 docs/云同步逻辑.md §4.4/§8）")]
+/// `docs/版本2.md·第一篇` §8 作废清单第 1 条。
+#[deprecated(note = "v6 废止：改用脏闩，且只读端不再阻断下行（见 docs/版本2.md·第一篇 §4.4/§8）")]
 pub const READER_BASE_REV: &str = "reader_base_revision";
 
 /// 被淘汰对象在库内的留存相对路径：`_conflicts/{guid}_{revision}.zip`。
@@ -961,7 +961,7 @@ fn attach_local_path(root: &Path, file_path: &str) -> PathBuf {
 
 /// 与远端**内容或落点**不一致的本地篇目（含本地已删）—— **只用于报告归因**。
 ///
-/// **不是判据**（v6 的判据只有三种量：闩 / 水位 / md5，见 `docs/云同步逻辑.md` §6.1）。
+/// **不是判据**（v6 的判据只有三种量：闩 / 水位 / md5，见 `docs/版本2.md·第一篇` §6.1）。
 /// 它只回答"哪些篇目的本地版与远端版不一样"，供覆盖时把"具体动了哪几篇"写进日志 ——
 /// 免得用户只看到"覆盖了 3 篇"却说不出是哪三篇。
 ///
@@ -1003,7 +1003,7 @@ fn diverged_note_guids(
 
 /// 下行（只读端 / 换机）。
 ///
-/// **v6 判据（`docs/云同步逻辑.md` §4.3）**：
+/// **v6 判据（`docs/版本2.md·第一篇` §4.3）**：
 /// 1. 有没有更新看**水位**（`remote.revision > meta.revision`，1 次 HEAD）；
 /// 2. 逐篇差分：**"内容同不同"用 md5**、**"本地改过没"用闩**；
 /// 3. **下行不铸版** —— 照为知，客户端下行只是接受权威水位，不产生新版本
@@ -1631,7 +1631,7 @@ pub fn gc_trash(local_root: &Path, days: u64) -> Result<GcReport, String> {
     Ok(rep)
 }
 
-/// 物理清理 `_conflicts/` 下超期留档（v6，`docs/云同步逻辑.md` §7 第 5 条）。
+/// 物理清理 `_conflicts/` 下超期留档（v6，`docs/版本2.md·第一篇` §7 第 5 条）。
 ///
 /// 与 [`gc_trash`] 的两处差别：
 /// - `_conflicts/` 是**扁平**的（`{guid}_{rev}.zip` / `{guid}_{rev}_local.zip`，无日期目录）
@@ -1833,7 +1833,7 @@ pub async fn startup_tasks(progress: ProgressFn) -> Result<String, String> {
             rep.removed, rep.kept, TRASH_RETENTION_DAYS
         ));
         // v6：`_conflicts/` 同批 GC（30 天）。留档是"被淘汰那一版"的唯一副本，
-        // 在云端 LWW 裁决（`云同步逻辑.md` §11）建成前，这是唯一的安全网 ⇒ 有保留期，但不无限留。
+        // 在云端 LWW 裁决（`版本2.md·第一篇` §11）建成前，这是唯一的安全网 ⇒ 有保留期，但不无限留。
         let rc = gc_conflicts(&root, CONFLICT_RETENTION_DAYS)?;
         if rc.removed > 0 || rc.kept > 0 {
             summary.push_str(&format!(
@@ -2037,7 +2037,7 @@ mod tests {
 
     /// 在本机对某篇做一次**真实库内写**（走 `library::save_note_html`，与 UI / CLI 同一条路径）。
     ///
-    /// **为什么不手搓等价物**（`docs/云同步逻辑.md` §6.3 末段的纪律）：自造的"改 md5 +
+    /// **为什么不手搓等价物**（`docs/版本2.md·第一篇` §6.3 末段的纪律）：自造的"改 md5 +
     /// `bump_note_revision`"会漏掉 v6 判据的**关键一半 —— 置脏闩**。漏了它，`sync_up` 根本
     /// 看不到待上行项，测试退化成"在我自己规定的世界里自证空跑"。真实写路径一次给出全部：
     /// 落盘字节、`exported_md5`/`exported_size`、`data_modified`、行级计数器、**闩**，
@@ -2924,7 +2924,7 @@ mod tests {
         sync_up(&store, &cfg, &src, noop_progress()).await.unwrap();
         let h = store.head(&cfg.cloud_key("manifest.db")).await.unwrap().unwrap();
         // 清单 meta.revision = **提交点铸出的号**：建库时 seed 的 1 被铸成 2
-        // （库内写不铸版、只有上行提交点能铸 —— 见 `docs/云同步逻辑.md` §4.1/§8）
+        // （库内写不铸版、只有上行提交点能铸 —— 见 `docs/版本2.md·第一篇` §4.1/§8）
         let expected = {
             let c = manifest::open_readonly(&src).unwrap();
             manifest::current_revision(&c).to_string()

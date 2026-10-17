@@ -1,4 +1,4 @@
-//! 导出目录同步清单缓存 `export.db`（docs/云端同步数据分析.md §5）
+//! 导出目录同步清单缓存 `export.db`（docs/版本2.md·第三篇 §5）
 //!
 //! 定位：**派生物**、可随时删除重建（§3 原则 2），任何同步流程不得把它当唯一事实来源。
 //! 职责：增量判定（`data_modified`/`package_size`）、GUID↔导出文件映射、换机恢复。
@@ -26,7 +26,7 @@ pub const FORMAT_HTML: &str = "html";
 /// `note.content_format` 取值：正文为 Markdown（md 包）
 pub const FORMAT_MARKDOWN: &str = "markdown";
 
-/// v6（`docs/云同步逻辑.md` §3.2 / M3）：**类型级水位**的 `meta` 键 ——
+/// v6（`docs/版本2.md·第一篇` §3.2 / M3）：**类型级水位**的 `meta` 键 ——
 /// 该类对象 `synced_revision` 的上界，即"我这一类对象已经对齐到哪儿了"。
 ///
 /// 直接照抄为知 `WIZ_META.SYNC_INFO` 的形态（它按 key 存 `DOCUMENT` / `ATTACHMENT` /
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS note (
   export_mode     TEXT NOT NULL,             -- 格式标识：'md'（库，§20.3）/ 'native'（导出逃生舱）；仅参与复用比对与准入
   exported_at     TEXT NOT NULL,
   revision        INTEGER NOT NULL DEFAULT 0, -- v3：本地内容修订计数器。**v6 起降级为仅 UI 展示/排序**，
-                                              --     任何判据不得读它（`docs/云同步逻辑.md` §4.1 纪律）
+                                              --     任何判据不得读它（`docs/版本2.md·第一篇` §4.1 纪律）
   origin          TEXT NOT NULL DEFAULT 'wiznote', -- v5：'wiznote'（导入自源）/ 'local'（库内新建，§3.3）
   content_format  TEXT NOT NULL DEFAULT 'html',    -- v5：正文表示 'html' / 'markdown'（§3.3）
   dirty_info      INTEGER NOT NULL DEFAULT 0, -- v6：脏闩·元信息段（标题/目录/URL 变）——写侧置、同步侧清
@@ -154,7 +154,7 @@ INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '6'), ('revisio
   ('document_watermark', '0'), ('attachment_watermark', '0'), ('deleted_watermark', '0');
 "#;
 
-/// 清单 schema 版本（本期：**v6 = v5 + 云同步口径重定的三件套**，见 `docs/云同步逻辑.md`）。
+/// 清单 schema 版本（本期：**v6 = v5 + 云同步口径重定的三件套**，见 `docs/版本2.md·第一篇`）。
 /// - **v3** 只加 `note.revision`：行级内容版本。**v6 起降级为「本地内容修订计数器，仅供 UI
 ///   展示/排序」，任何判据不得读它**（它是唯一"两边各写各的"计数器，拿它当判据就是 D 轮
 ///   两处真 bug 的原形）。
@@ -278,7 +278,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         }
     }
 
-    // 5) v6（`docs/云同步逻辑.md` §5）：**判据三件套**。
+    // 5) v6（`docs/版本2.md·第一篇` §5）：**判据三件套**。
     //    同一套查列存在性写法，幂等。全部 `NOT NULL DEFAULT 0` ⇒ 新库/旧库语义自洽：
     //    "干净且未发布"。**不设兼容分支**（无历史数据），也不回填 —— 回填反而会造假：
     //    v5 库里"某篇 revision>0"与"它有没有未上行改动"根本不是一回事。
@@ -380,7 +380,7 @@ pub fn open_readonly(dest_root: &Path) -> Result<Connection, String> {
 
 /// 库内附件的**系统保留目录**（下划线前缀，浏览侧不显示）。
 ///
-/// 约定来源：`需求分析文档.md` §FR-11 第 1 条 —— 库根只有「目录树 + 每篇 zip + `export.db`」，
+/// 约定来源：`版本1.md·第一篇` §FR-11 第 1 条 —— 库根只有「目录树 + 每篇 zip + `export.db`」，
 /// `_trash/`、`_conflicts/`、`_attachments/` 是保留区。
 ///
 /// 为什么不能落库根顶层 `attachments/`（A1'）：库根本身就是笔记目录树与同步根，
@@ -733,7 +733,7 @@ pub fn load_tombstone_guids(conn: &Connection) -> Result<HashSet<String>, String
 
 pub fn upsert_note(conn: &Connection, n: &ManifestNote) -> Result<(), String> {
     // v6：**新插入的行一律置脏**（`dirty_info=1, dirty_data=1`）—— 新行按定义就是
-    // "有内容待上行"，这就是 `docs/云同步逻辑.md` §5 末条的"导入即置脏"。
+    // "有内容待上行"，这就是 `docs/版本2.md·第一篇` §5 末条的"导入即置脏"。
     // **UPDATE 支刻意不碰闩**：复用支（内容未变的重写，如导出增量复用）必须保住原有闩值，
     // 否则每跑一次导出就会把全库置脏 ⇒ 增量上行彻底失效。
     // 由"INSERT 置脏 / UPDATE 不动"这一对行为覆盖所有建库路径（导入、重建、CLI 造库），
@@ -797,7 +797,7 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), String>
 
 /// 清单版本号自增（§8：单调递增、不依赖跨机时钟）；返回新值。
 ///
-/// **v6 起这是"铸版"动作本身**（`docs/云同步逻辑.md` §4.2 第 3 步）：只有 `sync_up` 的
+/// **v6 起这是"铸版"动作本身**（`docs/版本2.md·第一篇` §4.2 第 3 步）：只有 `sync_up` 的
 /// **提交点**能调用它，且必须与"清闩 + 写 `synced_revision` + 推水位"同处一个事务。
 /// **库内写路径不得调用**（§8 作废清单第 2 条）—— 本地改动只置闩，不铸版。
 pub fn bump_revision(conn: &Connection, updated_at: &str) -> Result<u64, String> {
@@ -830,7 +830,7 @@ pub fn mark_note_dirty(conn: &Connection, guid: &str, info: bool, data: bool) ->
 }
 
 /// 全表置脏（`dirty_data=1`）。用途：整库重建/批量导入后，让第一篇不落地就被漏传 ——
-/// 新行按定义就是"有内容待上行"（`docs/云同步逻辑.md` §5 末条的"导入即置脏"）。
+/// 新行按定义就是"有内容待上行"（`docs/版本2.md·第一篇` §5 末条的"导入即置脏"）。
 /// 列不存在（v5 老库）→ 返回 0，不报错（`rebuild` 走 `open_or_create`，不保证已迁移）。
 pub fn mark_all_notes_dirty(conn: &Connection) -> Result<usize, String> {
     if !column_exists(conn, "note", "dirty_data") {
@@ -950,7 +950,7 @@ pub fn set_note_synced_revision(conn: &Connection, guid: &str, rev: i64) -> Resu
 }
 
 /// 清闩 + 记铸造号（**提交点专用**）：上行成功的篇目，闩清零、`synced_revision` = 本轮铸造号。
-/// 必须在**铸版同一个事务**里调用（`docs/云同步逻辑.md` §4.2 第 3 步）。
+/// 必须在**铸版同一个事务**里调用（`docs/版本2.md·第一篇` §4.2 第 3 步）。
 pub fn mark_notes_synced(conn: &Connection, guids: &[String], rev: u64) -> Result<usize, String> {
     let mut n = 0;
     for g in guids {
@@ -1042,7 +1042,7 @@ pub fn recompute_watermarks(conn: &Connection) -> Result<(u64, u64, u64), String
 /// 单篇内容版本 +1。返回新值；行不存在返回 `None`。
 /// 只由 [`crate::library`] 的写路径调用，且**必须与导出字段更新同处一个事务**（T2/R13）。
 ///
-/// **v6 起语义降级**（`docs/云同步逻辑.md` §4.1）：它只是"本地内容修订计数器"，**仅供 UI 展示/排序**。
+/// **v6 起语义降级**（`docs/版本2.md·第一篇` §4.1）：它只是"本地内容修订计数器"，**仅供 UI 展示/排序**。
 /// 它是唯一"两边各写各的"计数器，**任何判据不得读它** —— 同步的"本地改过没"一律读脏闩
 /// （[`load_unsynced_note_guids`]）。
 pub fn bump_note_revision(conn: &Connection, guid: &str) -> Result<Option<i64>, String> {
@@ -1291,7 +1291,7 @@ pub fn rebuild(
     set_meta(&conn, "export_mode", crate::export::EXPORT_MODE)?;
     // v6：重建出的行是**从未同步过**的（`synced_revision` 默认 0），且 `DELETE FROM note`
     // 把所有闩都抹平了 ⇒ 必须整表置脏，否则重建后第一次上行会**一篇都不传**
-    // （`docs/云同步逻辑.md` §5 末条"导入/恢复即置脏"）。
+    // （`docs/版本2.md·第一篇` §5 末条"导入/恢复即置脏"）。
     mark_all_notes_dirty(&conn)?;
     mark_all_attachments_dirty(&conn)?;
     recompute_watermarks(&conn)?;

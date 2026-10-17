@@ -43,7 +43,7 @@ export async function exportNotesTo(location: string, title?: string): Promise<b
 /**
  * 批量导出「每份笔记一个 zip」（FR-08.1 批量形态）。
  * **D0**：只产 native —— 源 zip 的字节级原样拷贝（无损、不做任何删减），
- * 因此不再询问「是否瘦身」（原 FR-02 slim 模式已整体取消；论证见 docs/本地笔记读写实现.md §4.6）。
+ * 因此不再询问「是否瘦身」（原 FR-02 slim 模式已整体取消；论证见 docs/版本1.md·第三篇 §4.6）。
  */
 export async function exportNotesAsZips(location: string, title?: string): Promise<boolean> {
   const { open } = await import('@tauri-apps/plugin-dialog')
@@ -67,7 +67,7 @@ function zipExportSummary(r: FolderZipExportReport): string {
   return (
     `导出完成：${r.notes_exported} 篇笔记各为一个 zip（native：源 zip 逐字节拷贝，无损），` +
     `还原 ${r.folders_exported} 个目录，耗时 ${r.elapsed_ms} ms` +
-    // 同步清单计数（云端同步数据分析.md §5/§11 阶段一）
+    // 同步清单计数（版本2.md·第三篇 §5/§11 阶段一）
     `\n清单 export.db：新增 ${r.notes_added} / 重导 ${r.notes_reexported} / 复用 ${r.notes_reused}` +
     (r.notes_removed ? ` / 墓碑 ${r.notes_removed}` : '') +
     (r.manifest_path ? `（${r.manifest_path}）` : '') +

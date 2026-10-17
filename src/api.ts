@@ -174,7 +174,7 @@ export interface ExportReport {
 /** 每份笔记导出为一个 zip 的结果（FR-08.1 批量形态 + 同步清单计数，Rust 侧 serde flatten 展开）。
  *  **D0**：只产 native（源 zip 字节级拷贝），已无 slim 统计字段 */
 export interface FolderZipExportReport extends ExportReport {
-  /** 同步清单 export.db 路径（云端同步数据分析.md §5） */
+  /** 同步清单 export.db 路径（版本2.md·第三篇 §5） */
   manifest_path: string | null
   /** 清单四类计数：新增 / 重导 / 复用（零重写）/ 墓碑 */
   notes_added: number

@@ -508,7 +508,7 @@ fn export_one_to_dir(
 /// 导出模式：**恒为 `native`**（D0 全局约束「库必须无损 —— 导出只产 native」，2026-09-17 定稿）。
 /// 源 zip **字节级原样拷贝**（[`manifest::copy_with_md5`]），不重写、不增删任何条目；
 /// slim（FR-02 存储瘦身）已**整体取消**，其代码路径、UI 入口与报告产物一并移除
-/// （论证见 `docs/本地笔记读写实现.md` §4.6）。云端对象键的 `native/` 段是**冻结的协议
+/// （论证见 `docs/版本1.md·第三篇` §4.6）。云端对象键的 `native/` 段是**冻结的协议
 /// 字面量**（见 `sync::KEY_NATIVE`），与「格式可选」无关。
 pub const EXPORT_MODE: &str = "native";
 
@@ -863,7 +863,7 @@ pub fn export_folder_zips_fmt(
     let all_guids = load_all_guids(&conn)?;
     let now = manifest::format_utc(std::time::SystemTime::now());
     let tombstoned = manifest::reconcile_tombstones(&mconn, &all_guids, &now)?;
-    // v6（`docs/云同步逻辑.md` §8 作废清单第 2 条）：**导出不再铸版**。
+    // v6（`docs/版本2.md·第一篇` §8 作废清单第 2 条）：**导出不再铸版**。
     // 原处分是 `bump_revision`（"revision 单调递增，未来多端新旧判定"）—— 那是旧口径
     // （拿清单计数器当同步判据）的遗留。新口径下 `meta.revision` 只在**云同步上行提交点**
     // 推进，建库/重导路径只置脏闩（后者已由 `upsert_note` 的 INSERT 支与下面两处置脏覆盖）。
@@ -1287,7 +1287,7 @@ mod tests {
         );
     }
 
-    /// D0 回归护栏（`云同步模块设计-阶段二.md` §0 第 10 条 / `本地笔记读写实现.md` §4.6）：
+    /// D0 回归护栏（`版本2.md·第二篇` §0 第 10 条 / `版本1.md·第三篇` §4.6）：
     /// 导出产物必须与源 zip **逐字节一致**，模式恒 `native`，且不再产生 slim 统计与瘦身报告。
     #[test]
     fn test_native_export_is_byte_identical() {

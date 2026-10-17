@@ -1,4 +1,4 @@
-//! 笔记库服务（FR-11，docs/本地笔记读写实现.md §3/§4.1）
+//! 笔记库服务（FR-11，docs/版本1.md·第三篇 §3/§4.1）
 //!
 //! 库 = 主数据目录：一个目录即一个库，含 `export.db` 清单 + 目录树 + 每篇 zip。
 //! 本模块提供三件事：
@@ -358,7 +358,7 @@ pub struct NoteWriteReport {
     pub revision: i64,
     /// 写后的**当前**清单版本 `meta.revision`。
     ///
-    /// **v6 起它不是"写后的新版本号"**（`docs/云同步逻辑.md` §4.1/§8 作废清单第 2 条）：
+    /// **v6 起它不是"写后的新版本号"**（`docs/版本2.md·第一篇` §4.1/§8 作废清单第 2 条）：
     /// 版本号只在**云同步上行提交点**铸造，库内写路径**不铸版** ⇒ 本字段等于"写之前的值"，
     /// 只在"库从未同步过"时为 0。保留它是为了报告/UI 能显示库的当前版本，**不是**增量证据。
     pub manifest_revision: u64,
@@ -487,7 +487,7 @@ struct CommitResult {
 /// 三者必须同生共死（§13.6：写入后 revision 与 exported_md5 必须同步刷新，
 /// 否则云同步把旧内容当新内容或反之）。
 ///
-/// **v6 起这里不再铸版**（`docs/云同步逻辑.md` §8 作废清单第 2 条）：清单 `meta.revision`
+/// **v6 起这里不再铸版**（`docs/版本2.md·第一篇` §8 作废清单第 2 条）：清单 `meta.revision`
 /// 只在云同步**上行提交点**推进。库内写路径只置**脏闩** —— 这正是 D 轮两处真 bug 的修复：
 /// 当时"本地每写一次就推高计数器"，于是"本地改过一版"会把本地 rev 顶到与远端持平，
 /// "远端 rev ≥ 本地 rev"这类判据对它恒为假。
@@ -549,7 +549,7 @@ fn commit_note_write(conn: &Connection, guid: &str, p: &NoteRowPatch) -> Result<
 /// 只靠 `last_path` 的 basename 反查会找不到）。两者都是**只增不减**的信息，
 /// 旧墓碑（源时代 / v3）该两列为 NULL，恢复时按"无可恢复载荷"如实报错。
 ///
-/// **v6 起两处口径变化**（`docs/云同步逻辑.md` §4.5）：
+/// **v6 起两处口径变化**（`docs/版本2.md·第一篇` §4.5）：
 /// ① 不再铸版（本地写路径一律不铸版，见 [`commit_note_write`]）；
 /// ② 墓碑的 `synced_revision` **重置为 0** = "这条墓碑还没发布过"，它就是删除维度的脏闩
 ///    （note 行已删，闩无处可挂，只能挂在墓碑上）。
@@ -1836,7 +1836,7 @@ pub fn restore_note(
     let res = tx
         .execute(
             // v6：恢复出的行**置脏**（`dirty_data=1`）—— 它是"重新进入活表"的内容，
-            // 必须能被下一次上行带走（`docs/云同步逻辑.md` §5 末条"恢复即置脏"）。
+            // 必须能被下一次上行带走（`docs/版本2.md·第一篇` §5 末条"恢复即置脏"）。
             // `synced_revision` 留默认 0 = "这一版还没进过云端"，提交点会补上铸造号。
             "INSERT INTO note(guid, title, location, created, data_modified, url, doc_type,
                               has_attachment, package_size, exported_path, exported_size,

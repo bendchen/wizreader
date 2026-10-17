@@ -111,7 +111,7 @@ impl SyncSettings {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     /// 主数据目录（笔记库根，FR-11）：本软件唯一事实源，含 export.db + 目录树 + 每篇 zip。
-    /// 未设置时主界面为空态引导（docs/本地笔记读写实现.md §6.4）
+    /// 未设置时主界面为空态引导（docs/版本1.md·第三篇 §6.4）
     #[serde(default)]
     pub library_dir: Option<String>,
     /// 源数据目录（为知笔记原始数据）：**只读**、可选、可弃，仅用于导入与导出逃生舱（§8.3）。
@@ -171,7 +171,7 @@ impl Settings {
         (!lr.is_empty()).then(|| PathBuf::from(lr))
     }
 
-    /// 回收站根（T7 收口，docs/本地笔记读写实现.md §4.3/§16.5）。
+    /// 回收站根（T7 收口，docs/版本1.md·第三篇 §4.3/§16.5）。
     ///
     /// **库模式下恒为 `library_dir`**：回收站属于**库**，不属于云同步 ——
     /// `library::delete_note` 把文件移进 `library_dir/_trash/{YYYY-MM-DD}/`，
