@@ -996,8 +996,7 @@ function toggleSettings() {
       <!-- 新建笔记（仅库上下文可写时出现；后端 write_targets 另有兜底） -->
       <button v-if="writable" :disabled="creating" @click="onCreateNote">＋ 新建笔记</button>
       <span v-if="pickTip" class="pick-tip">{{ pickTip }}</span>
-      <!-- 写操作结果提示（失败另有弹窗带错误码，不在此处） -->
-      <span v-if="toast" class="op-toast">{{ toast }}</span>
+      <!-- 写操作结果提示已移到布局末端的固定浮层（.op-toast）：放在顶栏里会被 flex 挤成 0 宽 -->
       <span v-if="(picking || exporting) && pickProgress" class="progress-bar"
         ><i :style="{ width: pickPct + '%' }"></i
       ></span>
@@ -1266,6 +1265,11 @@ function toggleSettings() {
       @confirm="onDialogConfirm"
       @cancel="dialog = null"
     />
+    <!-- 写操作结果提示（固定浮层，3.5s 消失）。
+         曾经放在顶栏内联，但 `.topbar` 是单行 flex 且不换行，`.op-toast` 作为可收缩项
+         在 800px 默认窗宽下被挤成 0 宽 ⇒ 「已覆盖另一台设备的改动…」这类长文案完全看不见
+         （2026-10-17 GUI 人工验收发现，见 docs/版本3-结论.md §4.7）。 -->
+    <div v-if="toast" class="op-toast" role="status" aria-live="polite">{{ toast }}</div>
   </div>
 </template>
 
@@ -1420,18 +1424,27 @@ export default defineComponent({
   font-size: 12.5px;
   max-width: 560px;
 }
-/* 未保存 / 写操作结果提示（顶栏） */
+/* 未保存 / 写操作结果提示（**固定浮层**，底部居中；窗口多窄都看得见）
+   历史：原先是顶栏内联 span，被 `.topbar` 的单行 flex 挤成 0 宽 ⇒ 提示等于没有。
+   现在不参与顶栏排版，长文案自动换行，最大宽度随窗口收窄。 */
 .op-toast {
-  font-size: 12px;
-  color: #2e7d32;
-  background: rgba(46, 125, 50, 0.12);
-  border: 1px solid rgba(46, 125, 50, 0.35);
-  border-radius: 999px;
-  padding: 2px 10px;
-  max-width: 420px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 9999;
+  max-width: min(560px, calc(100vw - 48px));
+  font-size: 13px;
+  line-height: 1.5;
+  /* 不透明深底 + 绿色左条：压在编辑器/正文上也读得清（半透明绿底实测会与底下的提示文字糊在一起） */
+  color: #fff;
+  background: rgba(28, 32, 30, 0.94);
+  border-left: 3px solid #34a853;
+  border-radius: 10px;
+  padding: 9px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  word-break: break-word;
+  pointer-events: none;
 }
 /* 空态页 */
 .empty-page {
