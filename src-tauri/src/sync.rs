@@ -84,6 +84,13 @@ pub const KEY_NATIVE: &str = "native";
 /// 自检孤儿扫描豁免、**不进清单也不进索引**（只读端不会读到它）。
 pub const CONFLICT_DIR: &str = "_conflicts";
 
+/// **D2**：风险篇的**对象级**条件覆盖未命中（`If-Match` 412）。
+///
+/// 与「清单级 412」是两回事，必须分开：清单级未命中 ⇒ 回滚铸版、整轮中止/重试；
+/// 对象级未命中 ⇒ **只这一篇**本轮不上行（闩保持），其余篇照常提交。
+/// 单独用前缀是为了让结果收口处能把它与「真的传失败」区分开并给固定措辞。
+pub const ERR_OBJECT_PRECONDITION_FAILED: &str = "SYNC_OBJECT_PRECONDITION_FAILED";
+
 /// **v6 废止**：只读端护栏的基线（`meta.reader_base_revision`）。
 ///
 /// 旧口径下只读端"本地脏则拒绝下行"，需要一个**不会被本地写动作碰到**的基线来回答
@@ -149,6 +156,15 @@ pub struct SyncReport {
     /// tier=0（db-missing）等无文件可传的附件计数（N11d）
     #[serde(default)]
     pub oversized: usize,
+    /// **LWW D4**：本轮因「提交未命中」而**下行对齐后重试**的次数（0 = 一次命中）。
+    /// 只用于可观察性，不参与任何判据。
+    #[serde(default)]
+    pub retried: usize,
+    /// **LWW D4**：本轮**本端覆盖掉的远端版**篇数（= 风险篇条件覆盖成功数）。
+    /// `> 0` ⇒ 前端必须顶栏提示「副本在 `_conflicts/`」（2026-10-17 裁定）。
+    /// 附件下行**不计入**（附件不旁置，见 `sync_down` 的 D5）。
+    #[serde(default)]
+    pub overwritten_remote: usize,
     #[serde(default)]
     pub failures: Vec<SyncFailure>,
     pub manifest_uploaded: bool,
@@ -170,6 +186,8 @@ impl SyncReport {
             overwrote_dirty: 0,
             trashed: 0,
             oversized: 0,
+            retried: 0,
+            overwritten_remote: 0,
             failures: Vec::new(),
             manifest_uploaded: false,
             remote_revision: None,
@@ -332,14 +350,74 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
 }
 
+/// **LWW D1：提交循环（唯一对外入口）** —— `STALE` / `412` 不再直接失败，而是
+/// 「下行对齐 → 重判 → 重提交（≤3 次）」；其余错误一律不重试。
+///
+/// 为什么「对齐」就够：`sync_down` 会把 `meta.revision` 对齐到远端号（且**不铸版**），
+/// 本地未提交的改动由「writer 本地脏且分歧 ⇒ 不下载、旁置远端」保住。真云 e2e 里
+/// 「C 下行对齐 → C 上行 rev3」就是这条路径，本函数只是把两步合成一步。
+///
+/// 三次都不中 ⇒ `SYNC_MANIFEST_CONFLICT_RETRY_EXHAUSTED`，**所有闩保持、云端零改动**。
+/// 不引入后台无限重试：重试是「提交点抢不到」的局部补救，不是网络故障的自愈机制。
+pub async fn sync_up(
+    store: &dyn ObjectStore,
+    cfg: &SyncSettings,
+    root: &Path,
+    progress: ProgressFn,
+) -> Result<SyncReport, String> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err = String::new();
+    let mut retried = 0usize;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match sync_up_once(store, cfg, root, progress.clone()).await {
+            Ok(mut rep) => {
+                rep.retried = retried;
+                return Ok(rep);
+            }
+            Err(e) if is_retriable_submit_error(&e) => {
+                last_err = e;
+                if attempt == MAX_ATTEMPTS {
+                    break;
+                }
+                retried += 1;
+                crate::commands::append_sync_log(&format!(
+                    "提交未命中，下行对齐后重试（第 {attempt}/{MAX_ATTEMPTS} 次）：{last_err}"
+                ));
+                if let Err(de) = sync_down(store, cfg, root, progress.clone()).await {
+                    // 对齐都做不到就别空转：下一轮 up 只会撞同一堵墙，还会把真因埋掉
+                    return Err(format!(
+                        "SYNC_MANIFEST_CONFLICT_RETRY_EXHAUSTED: 提交未命中且下行对齐失败（{de}）——\
+                         上一轮错误：{last_err}；本轮**云端未改动**，闩保持，可稍后重试"
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "SYNC_MANIFEST_CONFLICT_RETRY_EXHAUSTED: 连续 {MAX_ATTEMPTS} 次提交未命中（{last_err}）——\
+         本轮**云端未改动**，所有闩保持置位，下次同步会重试"
+    ))
+}
+
+/// D1 的可重试错误：**只有「提交点没抢到」这两类**。
+/// 凭据 / 网络 / IO / 清单损坏一律不重试 —— 重试只会把同一个故障放大三倍、并延迟报错。
+fn is_retriable_submit_error(e: &str) -> bool {
+    e.contains("SYNC_MANIFEST_STALE") || e.contains("SYNC_MANIFEST_CONFLICT")
+}
+
 /// 上行（**U2 后：没有"先重新导出"这一级**）。
+///
+/// 这是 D1 的**内层**：一次提交尝试。对外请用 [`sync_up`]（带对齐重试）。
+/// 拆成内层是刻意的 —— 「412 回滚铸版」「STALE 拦下」这两个承重单测断言的是**内层**行为，
+/// 拆开才能让它们继续有效（否则只能整组重写成"外层最终成功"，回滚分支会失去唯一承重点）。
 ///
 /// `root` = 库根（调用方传 `crate::config::Settings::sync_root()`）。
 /// 库本身就是导出结果，故这里**直接扫库**组上传任务：这既是净简化，也是正确性要求 ——
 /// 旧的 `reexport_if_needed` 走的是 native `export_folder_zips`，在 md 库上会把 native 包
 /// 从源倒进库根，形态混杂且覆盖 md 包。
 ///
-/// **v6 判据（`docs/云同步逻辑.md` §4.2）**：
+/// **v6 判据（第一篇 §4.2）**：
 /// 1. 待上行集合 **只看闩**（`dirty_*` + 未发布墓碑），不比 md5、不比 revision；
 /// 2. 集合为空 ⇒ **不铸版、不提交**（空跑不得推进版本号，否则单调性会掺进空转噪声）；
 /// 3. 铸版 `new_rev = meta.revision + 1`，与"清闩 + 记 `synced_revision` + 推水位"同处一个事务；
@@ -348,7 +426,9 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
 ///    字节写回，一步到位（比逐行反演闩状态更可靠，也顺带覆盖"半途出错"的情况）。
 /// 5. **提交前两道闸**（§7.1）：① 本地判据 `SYNC_MANIFEST_STALE`（本端基线是否已落后于远端）；
 ///    ② 条件 PUT `If-Match` / `If-None-Match: *`（读—写窗口内是否有人插队；未命中 → 回滚铸版）。
-pub async fn sync_up(
+/// 6. **D2：风险篇的对象级条件覆盖** —— 对象上传发生在清单 PUT 之前，清单级条件 PUT 挡不住
+///    「对象已被我覆盖、清单才 412」这个窗口，故风险篇要先旁置远端版、再带 `If-Match` 上传。
+async fn sync_up_once(
     store: &dyn ObjectStore,
     cfg: &SyncSettings,
     root: &Path,
@@ -438,6 +518,12 @@ pub async fn sync_up(
         }
     }
 
+    // D2（LWW §3.2）：风险篇 = 上面判出的 `diverged`。对它们，上传时不能无条件覆盖 ——
+    // 对象上传发生在清单 PUT **之前**，若 412 落在「我传完对象、还没提交清单」这个窗口里，
+    // 对方那版字节已被我覆盖且**没有任何副本** ⇒ 违反「不静默丢数据」。
+    // 故这里记下**我读到的那一版 ETag**，上传时用 `If-Match` 把它锁住。
+    // 取不到 ETag（对象不存在 / HEAD 失败）⇒ 不做条件覆盖，退回无条件 PUT 并留痕。
+    let mut risky: HashMap<String, String> = HashMap::new();
     if let Some(rm) = &remote {
         let mut diverged: Vec<(String, i64)> = Vec::new();
         for (g, n) in &notes {
@@ -452,18 +538,59 @@ pub async fn sync_up(
                 diverged.push((g.clone(), *rrev));
             }
         }
+        if !diverged.is_empty() {
+            crate::commands::append_sync_log(&format!(
+                "风险篇 {} 篇（本地脏 ∧ md5 分歧 ∧ 远端 srev > 本端）：先旁置远端版，再条件覆盖",
+                diverged.len()
+            ));
+        }
         for (guid, rrev) in &diverged {
             let key = cfg.cloud_key(&format!("{KEY_NATIVE}/notes/{}", braced(guid)));
             let rel = conflict_rel_path(guid, *rrev);
+            // ETag 必须在 GET 之前取：它是「我正在旁置的这一版」的标识，也是覆盖时的前置条件。
+            // 若 HEAD/GET 之间又有人改写，PUT 会 412 ⇒ 本篇跳过（保守，绝不盲写）。
+            let etag = match store.head(&key).await {
+                Ok(Some(h)) => h.e_tag.clone(),
+                Ok(None) => None,
+                Err(e) => {
+                    crate::commands::append_sync_log(&format!("风险篇 {guid} 取 ETag 失败: {e}"));
+                    None
+                }
+            };
             match store.get(&key).await {
-                Ok(bytes) => match write_atomic(&root.join(&rel), &bytes) {
-                    Ok(()) => report.conflicts += 1,
-                    Err(e) => report.failures.push(SyncFailure {
-                        key: key.clone(),
-                        reason: format!("冲突副本落盘失败: {e}"),
-                        retryable: true,
-                    }),
-                },
+                Ok(bytes) => {
+                    // 自造副本豁免（§3.2）：远端字节若**就是本端这一版**（D1 重试：上一轮对象
+                    // 已 PUT 成功、只是清单 412 回滚了），旁置它只会产出一份假副本，且"覆盖"的
+                    // 是自己 —— 判据用内容相等，比重试轮次记录更可靠（也不怕进程重启）。
+                    let same_as_local = notes
+                        .get(guid)
+                        .map(|n| format!("{:x}", Md5::digest(&bytes)) == n.exported_md5)
+                        .unwrap_or(false);
+                    if same_as_local {
+                        crate::commands::append_sync_log(&format!(
+                            "风险篇 {guid}：远端对象已是本端内容（上轮对象已传、清单未提交），跳过旁置"
+                        ));
+                        continue;
+                    }
+                    match write_atomic(&root.join(&rel), &bytes) {
+                        Ok(()) => {
+                            report.conflicts += 1;
+                            match etag {
+                                Some(e) => {
+                                    risky.insert(guid.clone(), e);
+                                }
+                                None => crate::commands::append_sync_log(&format!(
+                                    "风险篇 {guid} 已旁置远端版，但取不到 ETag ⇒ 本篇退回无条件覆盖"
+                                )),
+                            }
+                        }
+                        Err(e) => report.failures.push(SyncFailure {
+                            key: key.clone(),
+                            reason: format!("冲突副本落盘失败: {e}"),
+                            retryable: true,
+                        }),
+                    }
+                }
                 Err(e) => report.failures.push(SyncFailure {
                     key: key.clone(),
                     reason: format!("冲突副本下载失败: {e}"),
@@ -474,7 +601,7 @@ pub async fn sync_up(
         if report.conflicts > 0 {
             crate::commands::append_sync_log(&format!(
                 "冲突留档 {} 篇 → {CONFLICT_DIR}/（writer：本地胜出，远端版旁置；\
-                 判据：**本地脏 ∧ md5 分歧**；远端清单 revision {} / 本地 {}）",
+                 判据：**本地脏 ∧ md5 分歧 ∧ 远端 srev > 本端**；远端清单 revision {} / 本地 {}）",
                 report.conflicts, rm.revision, report.local_revision
             ));
         }
@@ -494,6 +621,9 @@ pub async fn sync_up(
         hex_md5: String,
         ct: Option<&'static str>,
         kind: UpKind,
+        /// D2：`Some(etag)` ⇒ 这是**风险篇**，必须以 `If-Match: etag` 覆盖
+        /// （= 刚才被我旁置的那一版就是它）；`None` ⇒ 无条件 PUT（绝大多数篇）。
+        risk_etag: Option<String>,
     }
     let mut tasks: Vec<UpTask> = Vec::new();
 
@@ -510,6 +640,7 @@ pub async fn sync_up(
             hex_md5: n.exported_md5.clone(),
             ct: Some("application/zip"),
             kind: UpKind::Note(g.clone()),
+            risk_etag: risky.get(g).cloned(),
         });
     }
 
@@ -564,6 +695,7 @@ pub async fn sync_up(
             hex_md5: hex.clone(),
             ct: None,
             kind: UpKind::Attachment(a.file_path.clone(), cloud_rel),
+            risk_etag: None,
         });
     }
 
@@ -586,10 +718,49 @@ pub async fn sync_up(
             if skip {
                 return Ok((false, 0u64, t.kind.clone()));
             }
-            let rep = store
-                .put_file(&t.key, &t.path, &t.hex_md5, t.ct, &[])
-                .await
-                .map_err(|e| (t.key.clone(), e, t.kind.clone()))?;
+            // D2：风险篇走**对象级条件覆盖** —— 条件是"我旁置的那一版仍然在云端"。
+            // 412 ⇒ 本篇本轮不上行（其余篇照常），闩保持；下一轮自然会重判。
+            let rep = match &t.risk_etag {
+                Some(etag) => {
+                    match store
+                        .put_file_if(
+                            &t.key,
+                            &t.path,
+                            &t.hex_md5,
+                            t.ct,
+                            Precondition::Match(etag),
+                            &[],
+                        )
+                        .await
+                    {
+                        Ok(ConditionalPut::Written(r)) => r,
+                        Ok(ConditionalPut::PreconditionFailed) => {
+                            return Err((
+                                t.key.clone(),
+                                format!(
+                                    "{ERR_OBJECT_PRECONDITION_FAILED}: 风险篇对象在旁置后被他人改写\
+                                     （If-Match 未命中），本篇本轮跳过"
+                                ),
+                                t.kind.clone(),
+                            ))
+                        }
+                        Err(e) if e.starts_with(ERR_PRECONDITION_UNSUPPORTED) => {
+                            crate::commands::append_sync_log(&format!(
+                                "⚠️ 对象级条件写不可用，风险篇退回无条件覆盖（D2 纵深防御失效）: {e}"
+                            ));
+                            store
+                                .put_file(&t.key, &t.path, &t.hex_md5, t.ct, &[])
+                                .await
+                                .map_err(|e| (t.key.clone(), e, t.kind.clone()))?
+                        }
+                        Err(e) => return Err((t.key.clone(), e, t.kind.clone())),
+                    }
+                }
+                None => store
+                    .put_file(&t.key, &t.path, &t.hex_md5, t.ct, &[])
+                    .await
+                    .map_err(|e| (t.key.clone(), e, t.kind.clone()))?,
+            };
             Ok((true, rep.bytes, t.kind.clone()))
         }
     }))
@@ -611,9 +782,17 @@ pub async fn sync_up(
             Ok((true, bytes, kind)) => {
                 report.uploaded += 1;
                 uploaded_bytes += bytes;
-                if let UpKind::Attachment(fp, key_rel) = kind {
-                    uploaded_atts += 1;
-                    synced_atts.push((fp, key_rel));
+                match kind {
+                    UpKind::Attachment(fp, key_rel) => {
+                        uploaded_atts += 1;
+                        synced_atts.push((fp, key_rel));
+                    }
+                    UpKind::Note(g) => {
+                        // 条件覆盖成功 ⇒ 这一篇的远端旧版确实被我顶掉了（D4 计数）
+                        if risky.contains_key(&g) {
+                            report.overwritten_remote += 1;
+                        }
+                    }
                 }
             }
             Ok((false, _, kind)) => {
@@ -623,6 +802,11 @@ pub async fn sync_up(
                 }
             }
             Err((key, reason, kind)) => {
+                if reason.contains(ERR_OBJECT_PRECONDITION_FAILED) {
+                    crate::commands::append_sync_log(&format!(
+                        "本篇条件覆盖未命中，本轮跳过（闩保持，其余篇照常提交）: {key}"
+                    ));
+                }
                 report.failures.push(SyncFailure {
                     key,
                     reason,
@@ -641,7 +825,7 @@ pub async fn sync_up(
         let _ = manifest::set_attachment_cloud_key(
             &conn,
             file_path,
-            Some(&cfg.cloud_key(key_rel)),
+            Some(key_rel), // 存「相对 prefix」的键（schema 口径）；下行经 `att_object_key` 归一化
         );
     }
 
@@ -739,6 +923,21 @@ pub async fn sync_up(
     report.elapsed_ms = t0.elapsed().as_millis();
     persist_state(&report)?;
     Ok(report)
+}
+
+/// 附件云端对象键的**归一化**（D5 顺带修掉的旧缺陷）。
+///
+/// 清单 `attachment.cloud_key` 的口径是「**相对 prefix** 的键」（见 schema 注释），但历史写入口径
+/// 是 `cfg.cloud_key(key_rel)`（**带 prefix 的完整键**）—— 两者混在同一列里。下行若一律
+/// `cfg.cloud_key(stored)`，历史值会被再加一次 prefix（`wiz/wiz/native/...`）⇒ 404。
+/// 这里两种都接受：已经带 prefix 的原样用，否则补 prefix。**绝不二次加前缀**。
+fn att_object_key(cfg: &SyncSettings, stored_or_rel: &str) -> String {
+    let p = cfg.normalized_prefix();
+    if p.is_empty() || stored_or_rel.starts_with(&format!("{p}/")) {
+        stored_or_rel.to_string()
+    } else {
+        cfg.cloud_key(stored_or_rel)
+    }
 }
 
 /// 附件在**本机**的物理路径（上行读、下行写两个方向共用同一判据）。
@@ -1087,34 +1286,110 @@ pub async fn sync_down(
     manifest::recompute_watermarks(&conn)?;
 
     // 3b. 附件差集（Tier1–4 落盘；tier0 无文件）
+    //
+    // **D5（LWW §3.6，2026-10-17 用户拍板）**：判据从「本地文件在不在」改成
+    // 「**本地 md5 ≠ 云端对象 md5 ⇒ 云端胜**」。旧判据下「B 本地已有同名附件 ⇒ 永远拉不到」
+    // （`if !local.exists()`），多写者下静默分叉且两侧都无副本。
+    // 新规则：不一致就**覆盖本地版**、**不旁置、不进 `_conflicts/`**。
+    // 代价（已登记 §6 第 4 条）：判据只有"一样/不一样"、没有"谁更新"⇒ 本端手改的附件会被覆盖，
+    // 且同步顺序是 down→up，本地改动连抢跑机会都没有。开放附件编辑前必须改判（附件行记 md5 ⇒ v7）。
     let atts = manifest::load_attachments(&conn)?;
-    let mut att_downloads: Vec<(String, PathBuf)> = Vec::new();
+    // 先算「应有落点 + 云端键」（含旧清单 cloud_key 未回填的兜底）
+    let mut att_cands: Vec<(String, PathBuf)> = Vec::new();
     for a in &atts {
-        let Some(key_rel) = &a.cloud_key else { continue };
+        if a.tier == 0 {
+            continue; // db-missing：只有元数据行，没有文件可传/可下
+        }
+        let key_rel = match &a.cloud_key {
+            Some(k) => k.clone(),
+            None => {
+                let seg = match a.file_path.strip_prefix("attachments/") {
+                    Some(s) => s.to_string(),
+                    None => a.file_path.clone(),
+                };
+                if a.tier == 4 {
+                    format!("{KEY_NATIVE}/_unlinked_attachments/{seg}")
+                } else {
+                    format!("{KEY_NATIVE}/attachments/{seg}")
+                }
+            }
+        };
         // cloud_key 为完整对象键（相对 prefix）；本地按**库内保留区**落盘（A1'：`_attachments/…`）
-        let local = root.join(manifest::disk_rel_path(&a.file_path));
-        if !local.exists() {
-            att_downloads.push((cfg.cloud_key(key_rel), local));
+        att_cands.push((
+            att_object_key(cfg, &key_rel),
+            root.join(manifest::disk_rel_path(&a.file_path)),
+        ));
+    }
+    // 本地已有文件的 md5 一次性批量算（与上行同一路子，`spawn_blocking`；总量 ~14 MB）
+    let local_paths: Vec<PathBuf> = att_cands
+        .iter()
+        .filter(|(_, p)| p.is_file())
+        .map(|(_, p)| p.clone())
+        .collect();
+    let local_md5s: HashMap<String, String> = crate::commands::spawn_blocking(move || {
+        let mut m = HashMap::new();
+        for p in local_paths {
+            if let Ok(h) = manifest::md5_file(&p) {
+                m.insert(p.to_string_lossy().to_string(), h);
+            }
+        }
+        m
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 每个附件一次 HEAD 取云端 `content-md5`（与上行 `sync.rs` 的 HEAD 判跳过同一取法）。
+    // 之所以逐个小对象 HEAD：附件在清单里**不带 md5**，云端指纹只能现场问；带并发，代价可接受。
+    let md5_lookup = &local_md5s;
+    let heads = stream::iter(att_cands.into_iter().map(|(key, local)| {
+        let md5_lookup = md5_lookup;
+        async move {
+            let local_md5 = md5_lookup
+                .get(local.to_string_lossy().as_ref())
+                .cloned();
+            let cloud_md5 = match store.head(&key).await {
+                Ok(Some(h)) => h.meta("content-md5").cloned(),
+                Ok(None) => None, // 清单有行、对象不在：不主动删本地（宁可留着也不凭空毁数据）
+                Err(e) => return Err((key, format!("HEAD 失败: {e}"))),
+            };
+            Ok::<_, (String, String)>((key, local, local_md5, cloud_md5))
+        }
+    }))
+    .buffer_unordered(cfg.concurrency.max(1) as usize)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut att_downloads: Vec<(String, PathBuf)> = Vec::new();
+    let mut att_overwritten = 0usize;
+    for h in heads {
+        match h {
+            Ok((key, local, local_md5, cloud_md5)) => {
+                let need = match (&local_md5, &cloud_md5) {
+                    (None, _) => true,             // 本地没有 ⇒ 下载
+                    (Some(_), None) => false,      // 云端没有对象 ⇒ 保住本地
+                    (Some(l), Some(c)) => l != c,  // D5：不一致 ⇒ 云端胜
+                };
+                if need {
+                    if local_md5.is_some() {
+                        att_overwritten += 1;
+                    }
+                    att_downloads.push((key, local));
+                }
+            }
+            Err((key, e)) => report.failures.push(SyncFailure {
+                key,
+                reason: e,
+                retryable: true,
+            }),
         }
     }
-    // cloud_key 尚未回填（旧清单）→ 按规则现推
-    for a in &atts {
-        if a.cloud_key.is_some() || a.tier == 0 {
-            continue;
-        }
-        let seg = match a.file_path.strip_prefix("attachments/") {
-            Some(s) => s.to_string(),
-            None => a.file_path.clone(),
-        };
-        let cloud_rel = if a.tier == 4 {
-            format!("{KEY_NATIVE}/_unlinked_attachments/{seg}")
-        } else {
-            format!("{KEY_NATIVE}/attachments/{seg}")
-        };
-        let local = root.join(manifest::disk_rel_path(&a.file_path));
-        if !local.exists() {
-            att_downloads.push((cfg.cloud_key(&cloud_rel), local));
-        }
+    if !att_downloads.is_empty() {
+        crate::commands::append_sync_log(&format!(
+            "附件差集：{} 个待下载（判据 = 本地 md5 ≠ 云端 content-md5；其中 {} 个是**云端胜**、\
+             覆盖本地版，不旁置）",
+            att_downloads.len(),
+            att_overwritten
+        ));
     }
 
     let total = downloads.len() + att_downloads.len();
@@ -2463,6 +2738,10 @@ mod tests {
     /// 若放它上行，整份清单会把**别人那些行**一并写回旧值（对象字节却不回退）⇒
     /// 远端「清单行 ≠ 对象字节」的永久脱节。
     ///
+    /// **LWW D1 起断言的是内层 `sync_up_once`**：外层 `sync_up` 会把 STALE 变成「下行对齐 →
+    /// 重试」（见 `test_up_auto_aligns_and_retries_when_stale`），但**内层那道闸必须留着** ——
+    /// 它是最后一道防线（对齐失败、或对齐后别处又推进时全靠它拦）。
+    ///
     /// **变异检查**：删掉 `rm.revision > local_rev` 那道判据 → 本用例不再返回错误，
     /// `unwrap_err` 当场 panic；且"远端清单字节未被改动"的断言也会 FAILED。
     #[tokio::test]
@@ -2486,7 +2765,7 @@ mod tests {
 
         // B 也改了自己那一篇（有闩 ⇒ 会走到提交前判据），但它的基线已经旧了
         local_write(&b, guid, "<html><body>v1-from-b</body></html>");
-        let err = sync_up(&store, &cfg_of(&b), &b, p).await.unwrap_err();
+        let err = sync_up_once(&store, &cfg_of(&b), &b, p).await.unwrap_err();
         assert!(err.contains("SYNC_MANIFEST_STALE"), "got: {err}");
         assert!(
             err.contains("云端未改动"),
@@ -2527,7 +2806,8 @@ mod tests {
 
         local_write(&a, guid, "<html><body>v2</body></html>");
         store.force_precondition_failed(); // 模拟"提交那一刻别人抢先写了"
-        let err = sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap_err();
+        // **D1 起断言内层**：外层会把 412 变成「对齐 → 重试」，回滚本身由内层保证
+        let err = sync_up_once(&store, &cfg_of(&a), &a, p.clone()).await.unwrap_err();
         assert!(err.contains("SYNC_MANIFEST_CONFLICT"), "got: {err}");
         assert!(err.contains("已回滚本轮铸版"), "got: {err}");
         assert_eq!(
@@ -2728,5 +3008,426 @@ mod tests {
         assert_eq!(parse_date(&format!("{y:04}-{m:02}-{d:02}")), Some(days));
         // 已知锚点：2026-09-17（1970-01-01 起算）
         assert_eq!(days_from_civil(2026, 9, 17), 20_713);
+    }
+
+    // ==================================================================================
+    // LWW 选型定稿 §5.1 的 6 条承重单测（D1 提交循环 / D2 风险篇条件覆盖 / D5 附件下行）
+    // ==================================================================================
+    //
+    // 计数口径提醒：`seed_manifest` 把 `meta.revision` 置为 **1**（= "已有第 1 版"），
+    // 故首次 `sync_up` 铸出的是 **rev2**。下面所有 rev 断言都按这个基准。
+
+    /// 造一行附件 + 本地实体文件（`_attachments/{name}` = A1' 库内保留区）。
+    /// 返回 `(file_path, 本地绝对路径, 云端相对键)`。
+    fn seed_attachment(root: &Path, name: &str, body: &[u8]) -> (String, PathBuf, String) {
+        let file_path = format!("attachments/{name}");
+        let local = root.join(manifest::disk_rel_path(&file_path));
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, body).unwrap();
+        let cloud_rel = format!("{KEY_NATIVE}/attachments/{name}");
+        let conn = manifest::open_and_migrate(root).unwrap();
+        conn.execute(
+            "INSERT INTO attachment(file_path, display_name, size, tier, document_guid, \
+             source, cloud_key, dirty, synced_revision) VALUES (?1, ?2, ?3, 1, NULL, 'note', ?4, 0, 0)",
+            rusqlite::params![file_path, name, body.len() as i64, cloud_rel],
+        )
+        .unwrap();
+        (file_path, local, cloud_rel)
+    }
+
+    fn note_object_key(cfg: &SyncSettings, guid: &str) -> String {
+        cfg.cloud_key(&format!("{KEY_NATIVE}/notes/{}", braced(guid)))
+    }
+
+    /// **D1-1：STALE ⇒ 自动下行对齐 → 重判 → 重提交成功**（不再让用户手工"先 down 再 up"）。
+    ///
+    /// 场景 = 第二台写入端 B 的清单停在旧号，远端已被 A 推进。
+    /// 期望：`sync_up` 返回 Ok，`retried == 1`，铸版号 = 远端号 + 1，B 的正文真的进了云端。
+    ///
+    /// **变异检查**：把 D1 改回「STALE 直接 Err」→ `expect` 当场 panic。
+    #[tokio::test]
+    async fn test_up_auto_aligns_and_retries_when_stale() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-d1a");
+        let b = temp_root("lww-d1b");
+        let guid = "11111111-aaaa-3333-4444-555555555555";
+        let other = "22222222-bbbb-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        let r1 = sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        assert_eq!(r1.local_revision, 2, "首铸 = seed 的 1 + 1");
+
+        copy_lib(&a, &b); // B 从 rev2 的基线出发
+        add_note(&a, other, "o", "<html><body>other</body></html>");
+        let r2 = sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        let rev_before = r2.local_revision; // 3
+
+        local_write(&b, guid, "<html><body>v1-from-b</body></html>");
+        let rep = sync_up(&store, &cfg_of(&b), &b, p)
+            .await
+            .expect("D1：STALE 必须被自动对齐后重试，而不是失败");
+        assert_eq!(rep.retried, 1, "应记录一次对齐重试");
+        assert_eq!(rep.local_revision, rev_before + 1, "对齐后正常铸版，且只 +1");
+        assert!(rep.manifest_uploaded, "重试成功后必须提交清单");
+        assert!(rep.failures.is_empty(), "{:?}", rep.failures);
+
+        // 云端对象必须真的是 B 的正文（不是"本地以为成功了"）
+        let expect_md5 = manifest::md5_file(&b.join(exported_path_of(&b, guid))).unwrap();
+        let head = store
+            .head(&note_object_key(&cfg_of(&b), guid))
+            .await
+            .unwrap()
+            .expect("远端应有该篇对象");
+        assert_eq!(
+            head.meta("content-md5").map(|s| s.as_str()),
+            Some(expect_md5.as_str()),
+            "对齐重试后云端对象必须是 B 这一版"
+        );
+        // 远端清单号与本地一致
+        let mh = store
+            .head(&cfg_of(&b).cloud_key("manifest.db"))
+            .await
+            .unwrap()
+            .unwrap();
+        let rev_str = rep.local_revision.to_string();
+        assert_eq!(
+            mh.meta("revision").map(|s| s.as_str()),
+            Some(rev_str.as_str()),
+            "远端清单号必须与本地铸版号一致"
+        );
+    }
+
+    /// **D1-2：三次都未命中 ⇒ 明确错误码 + 闩全保持 + 云端清单字节一字未变**。
+    ///
+    /// **变异检查**：把重试次数改成 1（或把 412 当成功）→ 错误码/断言 FAILED。
+    #[tokio::test]
+    async fn test_up_retry_exhausted_keeps_latch_and_cloud_intact() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-d1-exhaust");
+        let guid = "33333333-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        let r1 = sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        let rev1 = r1.local_revision;
+
+        local_write(&a, guid, "<html><body>v2</body></html>");
+        let manifest_key = cfg_of(&a).cloud_key("manifest.db");
+        let remote_bytes = store.get(&manifest_key).await.unwrap();
+        store.force_precondition_failed_times(3); // 三次尝试，三次都被抢先
+
+        let err = sync_up(&store, &cfg_of(&a), &a, p).await.unwrap_err();
+        assert!(
+            err.contains("SYNC_MANIFEST_CONFLICT_RETRY_EXHAUSTED"),
+            "必须是「重试耗尽」这个明确错误码，不能报成别的: {err}"
+        );
+        assert!(err.contains("云端未改动"), "必须点明云端没动过: {err}");
+        assert_eq!(
+            store.get(&manifest_key).await.unwrap(),
+            remote_bytes,
+            "连撞三次 ⇒ 远端清单字节必须一字未变"
+        );
+        let c = manifest::open_readonly(&a).unwrap();
+        assert_eq!(
+            manifest::current_revision(&c),
+            rev1,
+            "每次 412 都要回滚铸版（三次都回滚）"
+        );
+        assert!(
+            !manifest::load_unsynced_note_guids(&c).unwrap().is_empty(),
+            "闩必须全保持（下次同步还能再试）"
+        );
+    }
+
+    /// **D2-1：风险篇 → 先旁置远端版，再带 `If-Match` 覆盖**。
+    ///
+    /// 意义：对象上传发生在清单 PUT 之前。若覆盖是**无条件**的，412 落在那个窗口里时
+    /// 对方那版字节已被我覆盖且无副本 —— 这条测试要保证"旁置先于覆盖"。
+    ///
+    /// **变异检查**：去掉风险篇的 `If-Match`（M2）→ `MemStore` 的 ETag 校验不再被走到，
+    /// 下面"旁置内容 == 远端原字节"仍成立，但把 `put_file_if` 换成 `put_file` 时
+    /// `test_up_risk_note_skipped_when_object_etag_moved` 必 FAILED（成对承重）。
+    #[tokio::test]
+    async fn test_up_risk_note_places_remote_then_conditional_put() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-d2a");
+        let b = temp_root("lww-d2b");
+        let guid = "44444444-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+
+        copy_lib(&a, &b);
+        local_write(&b, guid, "<html><body>远端版 v2</body></html>");
+        sync_up(&store, &cfg_of(&b), &b, p.clone()).await.unwrap();
+        let remote_srev = {
+            let c = manifest::open_readonly(&b).unwrap();
+            manifest::load_note_synced_revisions(&c)
+                .unwrap()
+                .get(guid)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert!(remote_srev > 2, "B 应已铸出新号: {remote_srev}");
+        let remote_zip = std::fs::read(b.join(exported_path_of(&b, guid))).unwrap();
+
+        // A 基于旧号改同一篇，**不手工 down**：D1 会自动对齐，对齐后这一篇成为风险篇
+        local_write(&a, guid, "<html><body>本地版 v2</body></html>");
+        let local_zip = std::fs::read(a.join(exported_path_of(&a, guid))).unwrap();
+        let rep = sync_up(&store, &cfg_of(&a), &a, p).await.unwrap();
+
+        assert_eq!(rep.retried, 1, "A 应经历一次对齐重试");
+        assert_eq!(rep.conflicts, 1, "必须旁置 1 篇远端版: {:?}", rep.failures);
+        assert_eq!(
+            rep.overwritten_remote, 1,
+            "D4：条件覆盖成功必须计入 overwritten_remote"
+        );
+        assert_eq!(
+            store.conditional_file_puts(),
+            1,
+            "风险篇必须走**对象级条件 PUT**（`put_file_if`），不是无条件覆盖（M2 变异点）"
+        );
+        let conflict = a.join(conflict_rel_path(guid, remote_srev));
+        assert!(conflict.is_file(), "留档应在 {}", conflict.display());
+        assert_eq!(
+            std::fs::read(&conflict).unwrap(),
+            remote_zip,
+            "留档的必须是**远端那一版**（先旁置、后覆盖）"
+        );
+        assert_eq!(
+            store.get(&note_object_key(&cfg_of(&a), guid)).await.unwrap(),
+            local_zip,
+            "本端胜出：云端对象应已被本端这一版覆盖"
+        );
+        assert_eq!(
+            rep.local_revision as i64,
+            remote_srev + 1,
+            "铸版号接在远端之后"
+        );
+    }
+
+    /// **D2-1b：`sync_up_once` 自己必须旁置，不依赖 `sync_down` 恰好先跑过**。
+    ///
+    /// 为什么单列一条：一键同步是 down→up，`sync_down` 的 writer 分支**也会**旁置同一份副本，
+    /// 于是「up 自己的旁置」在端到端里被掩盖了 —— 去掉它，`test_up_risk_note_places_remote_...`
+    /// 依然绿（变异 M3 SURVIVED 的实测原因）。这里直接构造「本端清单已是远端那一版，
+    /// 但该篇 `synced_revision` 记录落后」的状态（= 从旧备份恢复库、或历史库口径不一致的形态），
+    /// 让 **up 成为唯一的旁置者**：M3 必须在这种状态里被抓住。
+    #[tokio::test]
+    async fn test_up_places_conflict_copy_without_down() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-d2-uponly-a");
+        let b = temp_root("lww-d2-uponly-b");
+        let guid = "99999999-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        copy_lib(&a, &b);
+        local_write(&b, guid, "<html><body>远端 v2</body></html>");
+        sync_up(&store, &cfg_of(&b), &b, p.clone()).await.unwrap();
+        let remote_srev = {
+            let c = manifest::open_readonly(&b).unwrap();
+            manifest::load_note_synced_revisions(&c)
+                .unwrap()
+                .get(guid)
+                .copied()
+                .unwrap_or(0)
+        };
+        let remote_zip = std::fs::read(b.join(exported_path_of(&b, guid))).unwrap();
+
+        // A 拿到 B 的**整份清单**（meta.revision 已对齐 ⇒ 不会触发 STALE/对齐路径），
+        // 但把该篇的 srev 压回 1 ⇒ up 自己判出风险篇。
+        copy_lib(&b, &a);
+        local_write(&a, guid, "<html><body>本地 v2</body></html>");
+        {
+            let c = manifest::open_and_migrate(&a).unwrap();
+            manifest::set_note_synced_revision(&c, guid, 1).unwrap();
+        }
+
+        let rep = sync_up(&store, &cfg_of(&a), &a, p).await.unwrap();
+        assert_eq!(rep.retried, 0, "本端 meta.revision 已对齐，不该走重试路径");
+        assert_eq!(rep.conflicts, 1, "up 自己必须旁置远端版: {:?}", rep.failures);
+        let conflict = a.join(conflict_rel_path(guid, remote_srev));
+        assert!(
+            conflict.is_file(),
+            "up 不得把旁置责任推给 down —— 副本应在 {}",
+            conflict.display()
+        );
+        assert_eq!(std::fs::read(&conflict).unwrap(), remote_zip);
+    }
+
+    /// **D2-2：对象级 412 ⇒ 只该篇本轮跳过、闩保持、云端对象字节不变**。
+    ///
+    /// 与「清单级 412」分开：这里**不能**中止整轮，也不能回滚铸版（这一轮根本没提交）。
+    ///
+    /// **变异检查**：M5（把 D2 的 412 改成整轮中止）→ `unwrap` 直接 panic；
+    /// M2（去掉 `If-Match`）→ 注入的 412 不会被消费，`failures` 为空 ⇒ FAILED。
+    #[tokio::test]
+    async fn test_up_risk_note_skipped_when_object_etag_moved() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-d2-skip-a");
+        let b = temp_root("lww-d2-skip-b");
+        let guid = "55555555-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+
+        copy_lib(&a, &b);
+        local_write(&b, guid, "<html><body>远端版 v2</body></html>");
+        sync_up(&store, &cfg_of(&b), &b, p.clone()).await.unwrap();
+        let remote_zip = std::fs::read(b.join(exported_path_of(&b, guid))).unwrap();
+        let rev_after_b = {
+            let c = manifest::open_readonly(&b).unwrap();
+            manifest::current_revision(&c)
+        };
+
+        local_write(&a, guid, "<html><body>本地版 v2</body></html>");
+        store.force_precondition_failed(); // 模拟"旁置之后、覆盖之前，别人又改了这篇"
+
+        let rep = sync_up(&store, &cfg_of(&a), &a, p).await.unwrap();
+        assert!(
+            rep.failures
+                .iter()
+                .any(|f| f.reason.contains(ERR_OBJECT_PRECONDITION_FAILED)),
+            "应记一条对象级条件覆盖未命中: {:?}",
+            rep.failures
+        );
+        assert_eq!(
+            rep.direction, "none",
+            "唯一一篇被跳过 ⇒ 本轮没有可提交内容，不得铸版"
+        );
+        assert_eq!(
+            store.get(&note_object_key(&cfg_of(&a), guid)).await.unwrap(),
+            remote_zip,
+            "条件未命中 ⇒ 绝不能覆盖对方刚写的对象字节"
+        );
+        assert_eq!(
+            {
+                let c = manifest::open_readonly(&a).unwrap();
+                manifest::current_revision(&c)
+            },
+            rev_after_b,
+            "本轮未提交 ⇒ 本地不得铸版"
+        );
+        assert!(
+            !manifest::load_unsynced_note_guids(&manifest::open_readonly(&a).unwrap())
+                .unwrap()
+                .is_empty(),
+            "被跳过的篇必须保持闩置位（下一轮再试）"
+        );
+        // 旁置仍然发生了（这正是"先旁置"的意义：即便本轮没覆盖成功，远端版也留了档）
+        assert!(
+            a.join(CONFLICT_DIR).is_dir(),
+            "风险篇即便覆盖未命中，旁置副本也应已落盘"
+        );
+    }
+
+    /// **多写者：后提交者胜出，落败那版可在 `_conflicts/` 寻回**（§5.1 第 5 条）。
+    ///
+    /// 这是提交序 LWW 的**核心语义**：谁最后提交谁赢，且被顶掉的那一版**必须有副本**
+    /// （30 天 GC 是唯一反悔窗口）。
+    #[tokio::test]
+    async fn test_multi_writer_later_commit_wins_and_loser_is_retained() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-mw-a");
+        let b = temp_root("lww-mw-b");
+        let guid = "66666666-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>v1</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        copy_lib(&a, &b);
+
+        // A 先提交 v2（rev3）
+        local_write(&a, guid, "<html><body>A-v2</body></html>");
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        let a_zip = std::fs::read(a.join(exported_path_of(&a, guid))).unwrap();
+        let a_srev = {
+            let c = manifest::open_readonly(&a).unwrap();
+            manifest::load_note_synced_revisions(&c)
+                .unwrap()
+                .get(guid)
+                .copied()
+                .unwrap_or(0)
+        };
+
+        // B 后提交 v2（自动对齐后 rev4）⇒ 后提交者胜
+        local_write(&b, guid, "<html><body>B-v2</body></html>");
+        let b_zip = std::fs::read(b.join(exported_path_of(&b, guid))).unwrap();
+        let rep = sync_up(&store, &cfg_of(&b), &b, p).await.unwrap();
+        assert_eq!(rep.overwritten_remote, 1, "B 应覆盖掉 A 的那一版");
+        assert_eq!(
+            store.get(&note_object_key(&cfg_of(&b), guid)).await.unwrap(),
+            b_zip,
+            "后提交者胜出：云端对象必须是 B 那一版"
+        );
+        // 落败版（A 那一版）必须有副本，且按**远端 srev** 定名
+        let kept = b.join(conflict_rel_path(guid, a_srev));
+        assert!(kept.is_file(), "落败版应留档于 {}", kept.display());
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            a_zip,
+            "留档的必须是 A 那一版的**原始字节**"
+        );
+    }
+
+    /// **D5：附件下行判据 = md5 比对，不一致则云端胜**。
+    ///
+    /// 反面（旧行为）：`if !local.exists()` ⇒ 本地有同名文件就永不下载（静默分叉）。
+    /// 这里走**真实双机路径**（B 改附件 → 上行铸版 → A 下行），断言三件事：
+    /// ① 不一致 ⇒ 本地被云端版覆盖；② 该轮真的发了 GET；③ md5 一致后**不再重下**
+    /// （用"下一轮只多了 1 篇笔记 ⇒ downloaded 恰好 1"来证明附件没有掺进来）。
+    ///
+    /// **变异检查**：M6 改回 `if !local.exists()` → 第 ① 步 `downloaded` 会是 0 ⇒ FAILED。
+    #[tokio::test]
+    async fn test_down_attachment_cloud_wins_when_md5_differs() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("lww-att-down-a");
+        let b = temp_root("lww-att-down-b");
+        let guid = "77777777-aaaa-3333-4444-555555555555";
+        let other = "88888888-aaaa-3333-4444-555555555555";
+        seed_manifest(&a, guid, "<html><body>note</body></html>");
+        let (_fp, local_a, _cloud_rel) = seed_attachment(&a, "pic.bin", b"LOCAL-OLD");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        copy_lib(&a, &b);
+
+        // 另一台设备改同一个附件并提交（真实路径：附件变了 ⇒ 一定伴随一次清单铸版）
+        let local_b = b.join(manifest::disk_rel_path("attachments/pic.bin"));
+        std::fs::write(&local_b, b"CLOUD-NEW").unwrap();
+        let rb = sync_up(&store, &cfg_of(&b), &b, p.clone()).await.unwrap();
+        assert_eq!(rb.uploaded, 1, "B 应只上传这一个附件对象");
+
+        let d1 = sync_down(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+        assert_eq!(
+            std::fs::read(&local_a).unwrap(),
+            b"CLOUD-NEW",
+            "md5 不一致 ⇒ 云端胜，本地版被覆盖"
+        );
+        assert_eq!(d1.downloaded, 1, "应真的发了一次 GET（旧判据下这里是 0）");
+        assert!(
+            !a.join(CONFLICT_DIR).exists(),
+            "D5 明确不旁置（2026-10-17 拍板）⇒ 不得产生 _conflicts/"
+        );
+
+        // 让远端再前进一版（B 新增一篇笔记），A 再下行：附件 md5 已一致 ⇒ 不得重下。
+        // `downloaded == 1` 恰好是"那一篇笔记"，附件若掺进来就会是 2。
+        add_note(&b, other, "o2", "<html><body>另一个改动</body></html>");
+        sync_up(&store, &cfg_of(&b), &b, p.clone()).await.unwrap();
+        let d2 = sync_down(&store, &cfg_of(&a), &a, p).await.unwrap();
+        assert_eq!(d2.downloaded, 1, "只该拉那篇笔记：附件 md5 一致 ⇒ 一个 GET 都不发");
+        assert_eq!(std::fs::read(&local_a).unwrap(), b"CLOUD-NEW");
     }
 }

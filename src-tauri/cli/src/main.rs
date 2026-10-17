@@ -712,8 +712,13 @@ fn cloud_store(cfg: &SyncSettings) -> Result<wizreader_lib::store::S3Store, Stri
 fn print_sync_report(rep: &SyncReport) {
     match rep.direction.as_str() {
         "up" => println!(
-            "✅ 上行完成：上传 {} / 跳过 {} / 超限 {} / 冲突留存 {} / 清单{}，耗时 {} ms",
-            rep.uploaded, rep.skipped, rep.oversized, rep.conflicts,
+            "✅ 上行完成：上传 {} / 跳过 {} / 超限 {} / 冲突留存 {} / 对齐重试 {} / 覆盖远端版 {} / 清单{}，耗时 {} ms",
+            rep.uploaded,
+            rep.skipped,
+            rep.oversized,
+            rep.conflicts,
+            rep.retried,
+            rep.overwritten_remote,
             if rep.manifest_uploaded { "已传" } else { "未传" },
             rep.elapsed_ms
         ),

@@ -331,6 +331,12 @@ async function runAutoSync() {
     if (pulled > 0) parts.push(`下行 ${pulled} 项`)
     const conflicts = down.conflicts + up.conflicts
     if (conflicts > 0) parts.push(`冲突旁置 ${conflicts} 篇`)
+    // LWW D4（2026-10-17 裁定）：覆盖了另一台设备的改动**必须告知**，否则用户会以为
+    // "同步成功 = 大家都一样"。副本在 `_conflicts/`（30 天 GC，唯一反悔窗口）。
+    const overwritten = down.overwritten_remote + up.overwritten_remote
+    if (overwritten > 0) {
+      parts.push(`已覆盖另一台设备的改动 ${overwritten} 篇（副本在 _conflicts/）`)
+    }
     showToast(
       parts.length ? `自动同步完成：${parts.join('，')}` : '自动同步完成：云端已是最新',
     )

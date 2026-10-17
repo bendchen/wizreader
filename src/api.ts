@@ -264,6 +264,10 @@ export interface SyncReport {
   conflicts: number
   trashed: number
   oversized: number
+  /** LWW D4：本轮因「提交未命中」而下行对齐后重试的次数（0 = 一次命中） */
+  retried: number
+  /** LWW D4：本轮本端**覆盖掉的远端版**篇数；> 0 必须提示用户「副本在 _conflicts/」 */
+  overwritten_remote: number
   failures: SyncFailure[]
   manifest_uploaded: boolean
   remote_revision: number | null

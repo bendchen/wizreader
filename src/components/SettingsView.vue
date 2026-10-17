@@ -274,6 +274,8 @@ function syncReportSummary(r: SyncReport): string {
   else if (r.direction === 'down') parts.push(`下载 ${r.downloaded} / 移入回收站 ${r.trashed}`)
   else parts.push('无变更')
   if (r.conflicts) parts.push(`冲突留存 ${r.conflicts}`) // U5 → _conflicts/
+  if (r.retried) parts.push(`对齐重试 ${r.retried} 次`) // LWW D1
+  if (r.overwritten_remote) parts.push(`覆盖远端版 ${r.overwritten_remote}（副本在 _conflicts/）`) // LWW D4
   if (r.oversized) parts.push(`超限 ${r.oversized}`)
   if (r.failures.length) parts.push(`失败 ${r.failures.length}`)
   parts.push(`${r.elapsed_ms} ms`)

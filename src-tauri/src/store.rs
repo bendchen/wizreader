@@ -118,6 +118,21 @@ pub trait ObjectStore: Send + Sync {
         content_type: Option<&str>,
         extra_meta: &[(String, String)],
     ) -> Result<PutReport, String>;
+    /// 文件**条件**流式上传（LWW D2：风险篇覆盖前先旁置远端版，再用**读到那一版的 ETag** 做
+    /// `If-Match`）。语义与 [`ObjectStore::put_bytes_if`] 完全一致，只是 body 走 `Body::File`
+    /// 而不把笔记 zip 整体读进内存（N11a）。
+    ///
+    /// 为什么必须"按对象"条件写：笔记对象的上传发生在清单 PUT **之前**，清单级的条件 PUT
+    /// 挡不住「对象已被我覆盖、清单才 412」这个窗口 —— 那时对方那版字节已无副本。
+    async fn put_file_if(
+        &self,
+        key: &str,
+        path: &Path,
+        hex_md5: &str,
+        content_type: Option<&str>,
+        pre: Precondition<'_>,
+        extra_meta: &[(String, String)],
+    ) -> Result<ConditionalPut, String>;
     /// 前缀下的全部对象键（扁平键空间，无 delimiter）
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String>;
     async fn delete(&self, key: &str) -> Result<(), String>;
@@ -279,70 +294,35 @@ impl ObjectStore for S3Store {
         extra_meta: &[(String, String)],
     ) -> Result<ConditionalPut, String> {
         let hex = md5_hex(data);
-        // If-Match 方言（见 `if_match_unquoted` 字段注释）：已探测为「去引号」实现 ⇒ 直接发去引号值
-        let unquoted_mode = self
-            .if_match_unquoted
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let adapted: Option<String> = match (&pre, unquoted_mode) {
-            (Precondition::Match(e), true) => Some(e.trim_matches('"').to_string()),
-            _ => None,
-        };
-        let pre_eff: Precondition<'_> = match (&adapted, &pre) {
-            (Some(u), _) => Precondition::Match(u.as_str()),
-            (None, Precondition::Match(e)) => Precondition::Match(*e),
-            (None, Precondition::Absent) => Precondition::Absent,
-        };
-        let (status, rep) = self
-            .put_stream_inner(
-                key,
-                &hex,
-                None,
-                Some(pre_eff),
-                extra_meta,
-                Body::Bytes(data.to_vec()),
-            )
-            .await?;
-        // 引号形式吃了 412 ⇒ 试用「去引号」方言（一次）。重试结果按原语义解释：
-        // 2xx = 写入成功（并记住方言）；其余一律**维持第一次的 412 判定**（保守，不吞真冲突）。
-        let (status, rep) = if status == 412 && adapted.is_none() {
-            if let Precondition::Match(etag) = &pre {
-                let unq = etag.trim_matches('"');
-                if unq != *etag {
-                    match self
-                        .put_stream_inner(
-                            key,
-                            &hex,
-                            None,
-                            Some(Precondition::Match(unq)),
-                            extra_meta,
-                            Body::Bytes(data.to_vec()),
-                        )
-                        .await
-                    {
-                        Ok((s2, r2)) if (200..300).contains(&s2) => {
-                            self.if_match_unquoted
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            (s2, r2)
-                        }
-                        _ => (status, rep),
-                    }
-                } else {
-                    (status, rep)
-                }
-            } else {
-                (status, rep)
-            }
-        } else {
-            (status, rep)
-        };
-        match status {
-            s if (200..300).contains(&s) => Ok(ConditionalPut::Written(rep)),
-            412 | 409 => Ok(ConditionalPut::PreconditionFailed),
-            501 | 405 => Err(format!(
-                "{ERR_PRECONDITION_UNSUPPORTED}: 服务端对条件 PUT 返回 {status}（未实现）"
-            )),
-            other => Err(format!("PUT {key}（条件）返回 {other}")),
-        }
+        self.put_conditional_inner(
+            key,
+            &hex,
+            None,
+            pre,
+            extra_meta,
+            &|| Body::Bytes(data.to_vec()),
+        )
+        .await
+    }
+
+    async fn put_file_if(
+        &self,
+        key: &str,
+        path: &Path,
+        hex_md5: &str,
+        content_type: Option<&str>,
+        pre: Precondition<'_>,
+        extra_meta: &[(String, String)],
+    ) -> Result<ConditionalPut, String> {
+        self.put_conditional_inner(
+            key,
+            hex_md5,
+            content_type,
+            pre,
+            extra_meta,
+            &|| Body::File(path.to_path_buf()),
+        )
+        .await
     }
 
     async fn put_file(
@@ -475,6 +455,83 @@ impl S3Store {
             },
         ))
     }
+
+    /// 条件 PUT 的公共实现（bytes / file 两种 body 共用）。`body` 是**工厂**而不是值：
+    /// 412 后的「去引号方言」重试要再发一次 body，而 `Body` 是一次性的。
+    async fn put_conditional_inner(
+        &self,
+        key: &str,
+        hex_md5: &str,
+        content_type: Option<&str>,
+        pre: Precondition<'_>,
+        extra_meta: &[(String, String)],
+        body: &(dyn Fn() -> Body + Send + Sync),
+    ) -> Result<ConditionalPut, String> {
+        // If-Match 方言（见 `if_match_unquoted` 字段注释）：已探测为「去引号」实现 ⇒ 直接发去引号值
+        let unquoted_mode = self
+            .if_match_unquoted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let adapted: Option<String> = match (&pre, unquoted_mode) {
+            (Precondition::Match(e), true) => Some(e.trim_matches('"').to_string()),
+            _ => None,
+        };
+        let pre_eff: Precondition<'_> = match (&adapted, &pre) {
+            (Some(u), _) => Precondition::Match(u.as_str()),
+            (None, Precondition::Match(e)) => Precondition::Match(*e),
+            (None, Precondition::Absent) => Precondition::Absent,
+        };
+        let (status, rep) = self
+            .put_stream_inner(
+                key,
+                hex_md5,
+                content_type,
+                Some(pre_eff),
+                extra_meta,
+                body(),
+            )
+            .await?;
+        // 引号形式吃了 412 ⇒ 试用「去引号」方言（一次）。重试结果按原语义解释：
+        // 2xx = 写入成功（并记住方言）；其余一律**维持第一次的 412 判定**（保守，不吞真冲突）。
+        let (status, rep) = if status == 412 && adapted.is_none() {
+            if let Precondition::Match(etag) = &pre {
+                let unq = etag.trim_matches('"');
+                if unq != *etag {
+                    match self
+                        .put_stream_inner(
+                            key,
+                            hex_md5,
+                            content_type,
+                            Some(Precondition::Match(unq)),
+                            extra_meta,
+                            body(),
+                        )
+                        .await
+                    {
+                        Ok((s2, r2)) if (200..300).contains(&s2) => {
+                            self.if_match_unquoted
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            (s2, r2)
+                        }
+                        _ => (status, rep),
+                    }
+                } else {
+                    (status, rep)
+                }
+            } else {
+                (status, rep)
+            }
+        } else {
+            (status, rep)
+        };
+        match status {
+            s if (200..300).contains(&s) => Ok(ConditionalPut::Written(rep)),
+            412 | 409 => Ok(ConditionalPut::PreconditionFailed),
+            501 | 405 => Err(format!(
+                "{ERR_PRECONDITION_UNSUPPORTED}: 服务端对条件 PUT 返回 {status}（未实现）"
+            )),
+            other => Err(format!("PUT {key}（条件）返回 {other}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- MemStore（测试替身）
@@ -484,6 +541,10 @@ pub struct MemStore {
     objects: std::sync::Mutex<HashMap<String, MemObj>>,
     /// 测试钩子：下一次条件 PUT 强制返回 **412**（模拟"被别的写入端抢先"），用完即清
     force_412: std::sync::atomic::AtomicBool,
+    /// 测试钩子：让**接下来 N 次**条件 PUT 都返回 412（D1 的「三次都不中」要连撞三次），用完即清
+    force_412_count: std::sync::atomic::AtomicUsize,
+    /// 计数器：**文件**条件 PUT 走了几次（D2 的承重断言用：风险篇必须真的走条件写）
+    conditional_file_puts: std::sync::atomic::AtomicUsize,
     /// 测试钩子：下一次条件 PUT 强制报"服务端不支持"（验降级路径），用完即清
     force_unsupported: std::sync::atomic::AtomicBool,
 }
@@ -520,6 +581,16 @@ impl MemStore {
     pub fn force_precondition_failed(&self) {
         self.force_412
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// 测试钩子：让**接下来 n 次**条件 PUT 都 412（D1 重试耗尽的场景）
+    pub fn force_precondition_failed_times(&self, n: usize) {
+        self.force_412_count
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// 测试断言：文件条件 PUT 的累计次数（D2：风险篇必须走 `put_file_if`）
+    pub fn conditional_file_puts(&self) -> usize {
+        self.conditional_file_puts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     /// 测试钩子：让**下一次**条件 PUT 报"服务端不支持条件写"（验降级为无条件 PUT）
     pub fn force_precondition_unsupported(&self) {
@@ -582,6 +653,13 @@ impl ObjectStore for MemStore {
         if self.force_412.swap(false, SeqCst) {
             return Ok(ConditionalPut::PreconditionFailed);
         }
+        let forced_n = self
+            .force_412_count
+            .fetch_update(SeqCst, SeqCst, |n| if n > 0 { Some(n - 1) } else { None })
+            .is_ok();
+        if forced_n {
+            return Ok(ConditionalPut::PreconditionFailed);
+        }
         let mut map = self.objects.lock().unwrap();
         let current = map.get(key).map(|o| etag_of(&o.data));
         let satisfied = match pre {
@@ -631,6 +709,28 @@ impl ObjectStore for MemStore {
             .unwrap()
             .insert(key.to_string(), MemObj { data, meta });
         Ok(PutReport { bytes, hex_md5: actual })
+    }
+
+    async fn put_file_if(
+        &self,
+        key: &str,
+        path: &Path,
+        hex_md5: &str,
+        _content_type: Option<&str>,
+        pre: Precondition<'_>,
+        extra_meta: &[(String, String)],
+    ) -> Result<ConditionalPut, String> {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("SYNC_IO: 读取 {} 失败: {e}", path.display()))?;
+        let actual = md5_hex(&data);
+        if !hex_md5.is_empty() && actual != hex_md5 {
+            return Err(format!(
+                "SYNC_MD5_MISMATCH: {key} 清单 {hex_md5} / 磁盘 {actual}"
+            ));
+        }
+        self.conditional_file_puts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.put_bytes_if(key, &data, pre, extra_meta).await
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
