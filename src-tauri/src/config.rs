@@ -16,6 +16,38 @@ pub fn canonical_role(role: &str) -> &str {
     }
 }
 
+// ---------------------------------------------------------------- 下行策略（按需下载）
+//
+// 与 **角色** 是两件事，故分成两个字段：
+// - `role` 管**写权限**（writer 可上行 / reader 只下行）；
+// - `download_policy` 管**下行范围**（要不要把笔记包也拉到本地）。
+//
+// 组合是合法的四种：全量 writer（现行常态）、全量 reader、按需 writer（**云端是主库、
+// 本机只留清单**的笔记本）、按需 reader（手机/轻端）。
+//
+// 为什么做成"本机设置"而不是"库的属性"：同一份库在不同机器上可以有不同策略
+// （台式机全量、笔记本按需），把策略写进清单 meta 会被上行带到云端、污染别的机器。
+
+/// 下行策略：**全量**（默认）—— 清单 + 全部笔记包 + 附件
+pub const POLICY_FULL: &str = "full";
+/// 下行策略：**按需** —— 只同步清单（"数据库"），笔记包与附件在打开某篇时才拉那一篇
+pub const POLICY_ON_DEMAND: &str = "on_demand";
+
+/// 规范化策略：空值 / 未知值 / 历史文件缺字段 **一律回落到 [`POLICY_FULL`]**。
+///
+/// 回落方向是刻意的：全量是**不会让用户发现笔记"凭空不在"**的那一侧。
+/// 若把未知值当 `on_demand`，一次拼写错误就能让整库看起来像是丢了内容。
+pub fn canonical_policy(policy: &str) -> &'static str {
+    match policy.trim() {
+        POLICY_ON_DEMAND => POLICY_ON_DEMAND,
+        _ => POLICY_FULL,
+    }
+}
+
+fn default_download_policy() -> String {
+    POLICY_FULL.into()
+}
+
 /// 云同步配置（设计稿 §4.1）。整体 `serde(default)`，旧 settings.json 原样可读。
 /// **secret key 绝不出现于此文件**（D2/D3）——只存 keyring 条目的 user 名（endpoint|bucket|prefix 哈希）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,6 +90,10 @@ pub struct SyncSettings {
     /// 首次初始化是否已完成（用户问题 2 的判定位）
     #[serde(default)]
     pub initialized: bool,
+    /// 下行策略 [`POLICY_FULL`] | [`POLICY_ON_DEMAND`]（见 `canonical_policy`）。
+    /// 缺字段的老 settings.json 走 `default_download_policy()` ⇒ **全量**（= 现状不变）。
+    #[serde(default = "default_download_policy")]
+    pub download_policy: String,
 }
 
 fn default_sync_region() -> String {
@@ -88,11 +124,19 @@ impl Default for SyncSettings {
             concurrency: default_concurrency(),
             auto_check_on_start: false,
             initialized: false,
+            download_policy: default_download_policy(),
         }
     }
 }
 
 impl SyncSettings {
+    /// 是否**按需下载**：true ⇒ 下行只同步清单，笔记包/附件在"打开某篇"时才拉。
+    ///
+    /// 判定统一走这里（而不是各处比较字符串）：策略是**下行范围**的唯一开关，
+    /// 散落的字符串比较迟早分叉成"有的地方按需、有的地方全量"。
+    pub fn notes_on_demand(&self) -> bool {
+        canonical_policy(&self.download_policy) == POLICY_ON_DEMAND
+    }
     /// 规范化 prefix：去首尾 '/'（空串允许）
     pub fn normalized_prefix(&self) -> String {
         self.prefix.trim_matches('/').to_string()
@@ -255,6 +299,18 @@ pub fn migrate_settings(mut s: Settings, raw: Option<&str>) -> (Settings, Vec<St
     if canon != s.sync.role {
         migrated.push(format!("sync.role {} → {}", s.sync.role, canon));
         s.sync.role = canon;
+    }
+
+    // 下行策略归一：空值（老 settings.json 无此字段由 serde 补 `full`，这里兜住显式空串）/
+    // 未知值 → `full`。**绝不静默改用户的库内容**，只改这个开关并留痕。
+    let pol = canonical_policy(&s.sync.download_policy).to_string();
+    if pol != s.sync.download_policy {
+        migrated.push(format!(
+            "sync.download_policy {} → {}（未知/空值回落到全量）",
+            if s.sync.download_policy.is_empty() { "（空）" } else { &s.sync.download_policy },
+            pol
+        ));
+        s.sync.download_policy = pol;
     }
 
     (s, migrated)
@@ -755,5 +811,43 @@ mod tests {
         assert!(validate_sync(&s, None, Some(&sd_s)).is_ok());
         assert!(validate_sync(&s, Some("  "), Some(&sd_s)).is_ok(), "空白库根视同未设");
         let _ = std::fs::remove_dir_all(&sd);
+    }
+
+    /// 下行策略：**未知值一律回落到全量**，且回落有痕迹。
+    ///
+    /// 回落方向的承重用例：若哪天把 fallback 改成 `on_demand`，一次拼写错误
+    /// （`"ondemand"`）就会让整库看起来"笔记全没了"—— 那是不可接受的失败模式。
+    #[test]
+    fn test_download_policy_falls_back_to_full() {
+        assert_eq!(canonical_policy(""), POLICY_FULL);
+        assert_eq!(canonical_policy("ondemand"), POLICY_FULL, "拼写不符 → 全量（不得猜）");
+        assert_eq!(canonical_policy("ON_DEMAND"), POLICY_FULL, "大小写敏感：宁可全量");
+        assert_eq!(canonical_policy(POLICY_ON_DEMAND), POLICY_ON_DEMAND);
+        assert_eq!(canonical_policy(" full "), POLICY_FULL, "去空白后命中");
+
+        // 缺字段的老 settings.json ⇒ full（= 现状，不改变任何既有行为）
+        let s: Settings = serde_json::from_str(
+            r#"{"library_dir":"/tmp/lib","sync":{"enabled":true,"role":"reader"}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.sync.download_policy, POLICY_FULL);
+        assert!(!s.sync.notes_on_demand());
+
+        // 显式未知值 ⇒ 迁移成 full 并留痕
+        let raw = r#"{"sync":{"download_policy":"ondemand"}}"#;
+        let parsed: Settings = serde_json::from_str(raw).unwrap();
+        let (mig, log) = migrate_settings(parsed, Some(raw));
+        assert_eq!(mig.sync.download_policy, POLICY_FULL);
+        assert!(
+            log.iter().any(|l| l.contains("download_policy")),
+            "回落必须在同步日志里留痕: {log:?}"
+        );
+
+        // on_demand 是幂等的（不产生迁移日志）
+        let raw2 = r#"{"sync":{"download_policy":"on_demand"}}"#;
+        let p2: Settings = serde_json::from_str(raw2).unwrap();
+        let (m2, log2) = migrate_settings(p2, Some(raw2));
+        assert!(m2.sync.notes_on_demand());
+        assert!(log2.is_empty(), "{log2:?}");
     }
 }

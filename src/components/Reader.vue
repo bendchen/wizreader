@@ -36,6 +36,8 @@ const detail = ref<NoteDetail | null>(null)
 const error = ref('')
 const showAttachment = ref<AttachmentItem | null>(null)
 const copyHint = ref('')
+/** 按需下载：正在从云端拉这一篇（阅读区先显示等待态，**不**去渲染空的 iframe） */
+const fetching = ref(false)
 let hintTimer: number | null = null
 
 watch(
@@ -51,11 +53,55 @@ watch(
 
 async function load(guid: string) {
   error.value = ''
+  fetching.value = false
   try {
     detail.value = await api.getNoteDetail(guid)
+    // **按需下载**：包不在本机 ⇒ 先拉再渲染。
+    //
+    // 顺序不能反：iframe 的 `wiznote://{guid}/index.html` 一旦设上去就会立刻发请求，
+    // 那时包还没落盘 ⇒ 用户看到的是"笔记打不开"，而不是"正在下载"。
+    // 故这里先 await 拉取，再把 `detail` 交给模板（模板里 `detail` 一旦有值就渲染 iframe）。
+    if (!detail.value.downloaded) {
+      fetching.value = true
+      const ok = await fetchWithRetry(guid)
+      if (!ok) return // 错误已写入 `error`
+      detail.value = await api.getNoteDetail(guid)
+    }
   } catch (e) {
     error.value = String(e)
+  } finally {
+    fetching.value = false
   }
+}
+
+/**
+ * 拉取这一篇；遇 `SYNC_BUSY`（同步/写入正在跑，同一把 `.sync.lock`）短暂重试。
+ *
+ * 为什么在**前端**重试：后端一把锁是按"整库"粒度持的，拉取几秒、后台同步几十秒；
+ * 让用户为"刚好在同步"手动再点一次是没必要的心智负担。这里最多等 ~1.6 s，
+ * 超过就把后端原文（含错误码）摆给用户，由他决定是等同步完还是重试。
+ */
+async function fetchWithRetry(guid: string): Promise<boolean> {
+  for (let i = 0; i < 4; i++) {
+    try {
+      await api.fetchNote(guid)
+      return true
+    } catch (e) {
+      const busy = String(e).includes('SYNC_BUSY')
+      if (busy && i < 3) {
+        await new Promise((r) => window.setTimeout(r, 400))
+        continue
+      }
+      error.value = `这一篇还没有下载到本机，从云端拉取失败：\n\n${writeErrorText(e)}`
+      return false
+    }
+  }
+  return false
+}
+
+/** 重试按钮：清掉错误再走一遍完整流程 */
+function retry() {
+  if (props.guid) load(props.guid)
 }
 
 const frameSrc = computed(() =>
@@ -152,7 +198,16 @@ function jumpFolder() {
 <template>
   <div class="panel panel-reader">
     <template v-if="error">
-      <div class="empty-hint">{{ error }}</div>
+      <div class="empty-hint">
+        {{ error }}
+        <div style="margin-top: 12px"><button @click="retry">重试</button></div>
+      </div>
+    </template>
+    <template v-else-if="fetching">
+      <div class="empty-hint">
+        ☁ 这一篇只在云端，正在下载到本机…<br /><br />
+        <span style="font-size: 12px">下载完成后立即可读；同一篇不会被重复下载</span>
+      </div>
     </template>
     <template v-else-if="!detail">
       <div class="empty-hint">在左侧选择一篇笔记开始阅读<br /><br />↑↓ 可切换笔记，Cmd+F 检索</div>

@@ -96,6 +96,13 @@ export interface NoteItem {
   body_text_length: number
   package_size: number
   is_empty: boolean
+  /**
+   * 该篇的 zip 是否已在本机（**磁盘实况**，不是清单里的列）。
+   *
+   * `false` = 「本地没有笔记、都在云端」：清单有行、包在云端。列表打 ☁，
+   * 用户选中时由 `fetchNote` 拉取。全量下行策略下恒为 `true`。
+   */
+  downloaded: boolean
 }
 
 export interface AttachmentItem {
@@ -124,6 +131,8 @@ export interface NoteDetail {
    */
   body_format: 'md' | 'html' | null
   attachments: AttachmentItem[]
+  /** 包是否已在本机；`false` ⇒ 阅读区要先 `fetchNote` 再渲染 iframe */
+  downloaded: boolean
 }
 
 export interface SearchResult {
@@ -229,6 +238,8 @@ export interface SyncSettings {
   concurrency: number
   auto_check_on_start: boolean
   initialized: boolean
+  /** 下行策略：`full`（默认，全量拉包）/ `on_demand`（只同步清单，打开哪篇拉哪篇） */
+  download_policy: string
 }
 
 export interface SyncConfigView {
@@ -268,6 +279,8 @@ export interface SyncReport {
   retried: number
   /** LWW D4：本轮本端**覆盖掉的远端版**篇数；> 0 必须提示用户「副本在 _conflicts/」 */
   overwritten_remote: number
+  /** 按需下载：本轮**故意没下**的笔记包数（不是失败，也不是跳过） */
+  pending: number
   failures: SyncFailure[]
   manifest_uploaded: boolean
   remote_revision: number | null
@@ -279,6 +292,19 @@ export interface GcReport {
   removed: number
   bytes: number
   kept: number
+}
+
+/** 按需下载：单篇拉取结果（与 Rust `sync::FetchReport` 对齐） */
+export interface FetchReport {
+  guid: string
+  /** false = 本地本来就有（与清单相符）⇒ 零网络 */
+  fetched: boolean
+  bytes: number
+  /** 随本篇拉下的附件数 */
+  attachments: number
+  /** 派生索引是否已补齐该篇正文（false ⇒ 见 warnings，**不是**拉取失败） */
+  index_updated: boolean
+  warnings: string[]
 }
 
 export interface SyncStatusView {
@@ -495,6 +521,13 @@ export const api = {
   initCloudSync: (role: string) => invoke<{ report: SyncReport }>('init_cloud_sync', { role }),
   /** direction: "up" | "down" */
   runSync: (direction: string) => invoke<SyncReport>('run_sync', { direction }),
+  /**
+   * **按需下载**：把这一篇（含它的附件）从云端拉到本地，并补齐正文索引。
+   *
+   * 幂等且便宜：本地已有（体积 + MD5 与清单相符）⇒ 立即返回 `fetched=false`，一次网络都不打。
+   * 故阅读区可以**每次打开都调用**，不必先自己判断"这篇在不在本机"。
+   */
+  fetchNote: (guid: string) => invoke<FetchReport>('note_fetch', { guid }),
   getSyncStatus: () => invoke<SyncStatusView>('get_sync_status'),
   listTrash: () => invoke<TrashItem[]>('list_trash'),
   /** beforeDays > 0 时只清理早于该天数的目录；否则用默认保留期 30 天 */
@@ -540,6 +573,12 @@ const WRITE_HINTS: Record<string, string> = {
   NO_TOMBSTONE_PAYLOAD: '该墓碑来自旧版本，没有恢复载荷 —— 无法还原清单行',
   TRASH_FILE_MISSING: '回收站里已找不到该篇的文件（可能已被超期清理）',
   MANIFEST_BUSY: '清单正被占用，请稍后重试',
+  // 按需下载（本地没有笔记、都在云端）
+  SYNC_BUSY: '正在同步或写入，稍等几秒再打开这一篇',
+  SYNC_DISABLED: '这一篇还没下载到本机，而云同步未启用/未初始化 —— 到设置里配置云同步后即可拉取',
+  SYNC_NOTE_FETCH_FAILED: '从云端读取该篇失败（网络或凭据问题）',
+  SYNC_NOTE_MD5_MISMATCH:
+    '云端对象与清单记录不一致（数据可能已损坏或被替换），已拒写。建议先重建/核对云端，不要强行读取',
 }
 
 /** 从任意错误里抽出 `CODE:` 前缀；没有码时返回空串 */

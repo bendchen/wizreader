@@ -163,6 +163,7 @@ fn main() {
         Some("cloud-test") => cmd_cloud_test(),
         Some("cloud-init") => cmd_cloud_init(&args),
         Some("cloud-sync") => cmd_cloud_sync(&args),
+        Some("note-fetch") => cmd_note_fetch(&args),
         Some("trash-gc") => cmd_trash_gc(&args),
         Some("build-library-index") => cmd_build_library_index(&args),
         // 笔记库写入（FR-11 P2 / S1：先在命令行验证，再接 UI）
@@ -194,6 +195,7 @@ fn main() {
             eprintln!("  wiz-cli cloud-test                                   云端连通性自检（读取应用内已存配置与凭据）");
             eprintln!("  wiz-cli cloud-init <export|reader>                   首次初始化（导出端=全量上行；阅读端=全量下行）");
             eprintln!("  wiz-cli cloud-sync <up|down>                         手动同步（上行复用导出缓存，下行 HEAD 比对差量）");
+            eprintln!("  wiz-cli note-fetch <guid>                            按需下载的单篇补下（本地已有则零网络）");
             eprintln!("  wiz-cli trash-gc [--days 30]                         清理本地同步根 _trash/ 超期项");
             eprintln!("  wiz-cli build-library-index <library_dir> [--index-db <file>]   构建笔记库派生索引（只读 export.db）");
             eprintln!("  --- 笔记库写入（P2/S1：CLI 先验证，写前建议先冷备）---");
@@ -723,8 +725,8 @@ fn print_sync_report(rep: &SyncReport) {
             rep.elapsed_ms
         ),
         "down" => println!(
-            "✅ 下行完成：下载 {} / 移入回收站 {} / 失败 {}，耗时 {} ms",
-            rep.downloaded, rep.trashed, rep.failures.len(), rep.elapsed_ms
+            "✅ 下行完成：下载 {} / 移入回收站 {} / 失败 {} / 按需跳过 {}，耗时 {} ms",
+            rep.downloaded, rep.trashed, rep.failures.len(), rep.pending, rep.elapsed_ms
         ),
         "none" => println!("✅ 无变更（远端 revision {} ≤ 本地 {}）", rep.remote_revision.unwrap_or(0), rep.local_revision),
         _ => println!("{rep:?}"),
@@ -953,6 +955,54 @@ fn cmd_cloud_sync(args: &[String]) {
             wizreader_lib::sync::sync_down(&store, &cfg, &root, p).await?
         };
         print_sync_report(&rep);
+        Ok::<(), String>(())
+    };
+    if let Err(e) = run_in_blocking(run) {
+        eprintln!();
+        eprintln!("❌ {e}");
+        std::process::exit(1);
+    }
+}
+
+/// note-fetch <guid>：**按需下载**的单篇补下 —— "打开一篇"在 CLI 里等价于调它。
+///
+/// 库根与云配置都取自 `settings.json`（与 `cloud-sync` 同源），故在按需模式的机器上，
+/// 它就是把"清单里有、磁盘上没有"的那一篇补齐的入口。幂等：本地已有 ⇒ 零网络直接返回。
+fn cmd_note_fetch(args: &[String]) {
+    let guid = match args.get(1).filter(|s| !s.starts_with("--")) {
+        Some(g) => g.clone(),
+        None => {
+            eprintln!("用法: wiz-cli note-fetch <guid>（库根与云配置取自 settings.json）");
+            std::process::exit(1);
+        }
+    };
+    let run = async move {
+        let cfg = cloud_cfg()?;
+        let store = cloud_store(&cfg)?;
+        let root = wizreader_lib::config::load_settings()
+            .sync_root()
+            .ok_or("SYNC_CONFIG_INVALID: 未设置笔记库目录（同步根即库根）")?;
+        let _guard: SyncGuard = match wizreader_lib::sync::try_acquire(&root)? {
+            Some(g) => g,
+            None => return Err("SYNC_BUSY: 已有同步任务在执行".into()),
+        };
+        let index_db = wizreader_lib::config::index_file_for_library(&root);
+        let rep =
+            wizreader_lib::sync::fetch_note(Some(&store), &cfg, &root, &index_db, &guid).await?;
+        if rep.fetched {
+            println!(
+                "✅ 已拉取 {}：{} B，随篇附件 {} 个，索引{}",
+                rep.guid,
+                rep.bytes,
+                rep.attachments,
+                if rep.index_updated { "已补齐" } else { "未补齐（可重建索引）" }
+            );
+        } else {
+            println!("✅ {} 已在本机（与清单一致），无需下载", rep.guid);
+        }
+        for w in &rep.warnings {
+            eprintln!("  ⚠ {w}");
+        }
         Ok::<(), String>(())
     };
     if let Err(e) = run_in_blocking(run) {
@@ -1312,12 +1362,29 @@ fn cmd_verify_library(args: &[String]) {
         }
     };
     let secs = t0.elapsed().as_secs_f64();
+    // **按需下载**（`sync.download_policy = on_demand`）：本库的常态就是"清单有行、磁盘没有包"，
+    // 把它当失败会让这个验收工具在合法状态下恒 rc=1（脚本与人都被带偏）。
+    // 摘出来单独计数、照旧打印，但**不计入问题数**；全量模式下它是真问题，一字不改。
+    let on_demand = wizreader_lib::config::load_settings().sync.notes_on_demand();
+    let (absent, warns): (Vec<String>, Vec<String>) = if on_demand {
+        warns
+            .into_iter()
+            .partition(|w| wizreader_lib::manifest::is_absent_warning(w))
+    } else {
+        (Vec::new(), warns)
+    };
     if warns.is_empty() {
         println!("✅ 未发现问题（耗时 {secs:.2}s）");
+        if let Some(w) = absent.first() {
+            println!("   · 按需下载：{w} —— 已按设计跳过（打开即拉取，不参与检索）");
+        }
     } else {
         println!("⚠ 发现 {} 条问题（耗时 {secs:.2}s）：", warns.len());
         for w in &warns {
             println!("   • {w}");
+        }
+        if let Some(w) = absent.first() {
+            println!("   · 按需下载：{w} —— 已按设计跳过（打开即拉取，不参与检索）");
         }
         if !deep {
             println!("   提示：以上不含内容比对。查「体积相符但内容已变」请加 --deep。");
@@ -1341,10 +1408,12 @@ fn cmd_verify_library(args: &[String]) {
         };
         let zs = wizreader_lib::zipserve::ZipService::with_resolver(resolver);
         // 空结果绝不能静默（踩过：列名写错 → 查询报错 → 0 篇"体检通过"，看着像好消息）
-        let guids: Vec<String> = match conn
-            .prepare("SELECT guid FROM note ORDER BY guid")
+        // 带 `exported_path` 一起取：按需下载的库里有"清单有行、磁盘无包"的篇，
+        // 它们没有正文可读 —— 必须**先判在不在**，否则体检会把 1780 篇全记成"读取失败"。
+        let rows: Vec<(String, String)> = match conn
+            .prepare("SELECT guid, exported_path FROM note ORDER BY guid")
             .and_then(|mut st| {
-                st.query_map([], |r| r.get::<_, String>(0))
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                     .map(|it| it.flatten().collect())
             }) {
             Ok(v) => v,
@@ -1353,10 +1422,11 @@ fn cmd_verify_library(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        if guids.is_empty() {
+        if rows.is_empty() {
             eprintln!("❌ 清单里没有任何活跃笔记（note 表为空），渲染体检无从谈起");
             std::process::exit(1);
         }
+        let (mut not_local, mut checked) = (0usize, 0usize);
         let t0 = std::time::Instant::now();
         let (mut ok, mut empty, mut md, mut html) = (0usize, 0usize, 0usize, 0usize);
         let mut bad: Vec<String> = Vec::new();
@@ -1366,7 +1436,12 @@ fn cmd_verify_library(args: &[String]) {
         // 这是 M1 转换器与渲染器之间唯一能被自动化抓住的口径差，故常驻体检。
         let (mut fence_total, mut rendered_total) = (0usize, 0usize);
         let mut bleed: Vec<(usize, String)> = Vec::new();
-        for g in &guids {
+        for (g, rel) in &rows {
+            if !lib.join(rel).is_file() {
+                not_local += 1; // 按需下载：包还在云端，没有正文可渲染（不是缺陷）
+                continue;
+            }
+            checked += 1;
             let (fmt, src) = match zs.read_note_body(g) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1403,12 +1478,17 @@ fn cmd_verify_library(args: &[String]) {
             }
         }
         println!(
-            "🔎 阅读链路体检：{}/{} 篇可渲染（md 包 {} / 原生包 {}；源正文为空 {} 篇），耗时 {:.2}s",
+            "🔎 阅读链路体检：{}/{} 篇可渲染（md 包 {} / 原生包 {}；源正文为空 {} 篇{}），耗时 {:.2}s",
             ok,
-            guids.len(),
+            checked,
             md,
             html,
             empty,
+            if not_local > 0 {
+                format!("；{not_local} 篇尚未下载，未参与体检")
+            } else {
+                String::new()
+            },
             t0.elapsed().as_secs_f64()
         );
         if md > 0 {

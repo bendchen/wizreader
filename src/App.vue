@@ -179,6 +179,10 @@ onMounted(async () => {
     pickProgress.value = e.payload
     pickTip.value = `导出中 ${e.payload.done}/${e.payload.total} 篇`
   })
+  // 按需下载：某篇刚从云端落到本机 ⇒ 列表上的 ☁ 标记要立刻消失（否则用户以为还没下）
+  listen<{ guid: string }>('note-fetched', () => {
+    listVersion.value += 1
+  })
 })
 
 async function refreshStatus() {
@@ -360,8 +364,29 @@ function blockedByReaderRole(what: string): boolean {
   return true
 }
 
+/**
+ * **按需下载**：写操作前确保这一篇在本机。
+ *
+ * 为什么写路径也要这一句：库内写（编辑/改名/移动/删除）的实现都是"改包"或"搬包"
+ * （`save_note_source` 重写 zip 条目、`rename/move` 换落点、`delete` 移进 `_trash`），
+ * 包不在磁盘上就只剩 `NOTE_PACKAGE_MISSING`。列表右键菜单可以直接对一篇"只在云端"的笔记
+ * 发写指令（阅读区会先拉取，右键菜单不经过阅读区），故这些入口统一先拉一次。
+ *
+ * 拉取是幂等的（本地已有 ⇒ 零网络秒回），所以不必先判断"在不在本机"。
+ */
+async function ensureNoteLocal(guid: string, what: string): Promise<boolean> {
+  try {
+    await api.fetchNote(guid)
+    return true
+  } catch (e) {
+    alert(`${what}失败\n\n${writeErrorText(e)}`)
+    return false
+  }
+}
+
 async function openEdit(item: NoteRef) {
   if (blockedByReaderRole('编辑正文')) return
+  if (!(await ensureNoteLocal(item.guid, '编辑正文'))) return
   editing.value = item
 }
 
@@ -373,13 +398,15 @@ async function onEditSaved(rep: NoteWriteReport) {
   await afterWrite()
 }
 
-function onRenameNote(item: NoteRef) {
+async function onRenameNote(item: NoteRef) {
   if (blockedByReaderRole('重命名')) return
+  if (!(await ensureNoteLocal(item.guid, '重命名'))) return
   dialog.value = { kind: 'prompt', title: '重命名笔记', message: `原标题：${item.title}`, initial: item.title, item }
 }
 
 async function onDeleteNote(item: NoteRef) {
   if (blockedByReaderRole('删除')) return
+  if (!(await ensureNoteLocal(item.guid, '删除'))) return
   dialog.value = {
     kind: 'confirm',
     title: '删除笔记',
@@ -394,6 +421,7 @@ async function onDeleteNote(item: NoteRef) {
 
 async function onMoveNote(item: NoteRef) {
   if (blockedByReaderRole('移动')) return
+  if (!(await ensureNoteLocal(item.guid, '移动'))) return
   const folders = await folderOptions()
   dialog.value = {
     kind: 'folder',
@@ -439,6 +467,7 @@ async function onDropNote(location: string) {
   if (!item) return
   const target = location === '' ? '/' : location
   if (target === item.location) return
+  if (!(await ensureNoteLocal(item.guid, '移动'))) return
   try {
     const rep = await api.moveNote(item.guid, target)
     showToast(`已移动：${rep.title} → ${rep.exported_path}`)
@@ -448,8 +477,10 @@ async function onDropNote(location: string) {
   }
 }
 
-/** 右键菜单：在访达中显示该篇（库内绝对路径由后端按清单解析，前端不拼路径） */
+/** 右键菜单：在访达中显示该篇（库内绝对路径由后端按清单解析，前端不拼路径）。
+ *  按需下载：包不在本机时先拉下来 —— 否则"在访达中显示"会指向一个不存在的文件。 */
 async function revealNote(item: NoteItem) {
+  if (!(await ensureNoteLocal(item.guid, '在访达中显示'))) return
   try {
     await api.revealInFinder(await api.getNoteFilePath(item.guid))
   } catch (e) {
@@ -586,8 +617,11 @@ async function onDialogConfirm(value: string, folderPicked: string) {
         currentNote.value = null
       }
     }
-    if (rep.warnings.length) {
-      alert(`已完成（${rep.op}）：${rep.exported_path}\n\n注意：\n${rep.warnings.join('\n')}`)
+    // 「清单行缺文件」是**整库**状态（按需下载下更是常态：清单有行、包在云端），
+    // 与本次改名/移动无关 —— 不能因为它把一次成功的写操作变成一屏告警。
+    const real = rep.warnings.filter((w) => !w.startsWith('清单行缺文件'))
+    if (real.length) {
+      alert(`已完成（${rep.op}）：${rep.exported_path}\n\n注意：\n${real.join('\n')}`)
     } else {
       showToast(`${rep.op === 'delete' ? '已移入回收站' : '已完成'}：${rep.title}`)
     }

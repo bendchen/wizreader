@@ -733,23 +733,33 @@ pub fn build_library_index(
     // ---- 逐篇 note + fts（正文经 resolver 定位 zip）----
     let zip = ZipService::with_resolver(resolver.clone() as Arc<dyn NotePathResolver>);
     let mut disk_hits = 0usize;
+    let mut absent = 0usize;
     let mut failed: Vec<String> = Vec::new();
     dst.execute("BEGIN", []).map_err(|e| e.to_string())?;
     let total = notes.len();
     for (i, n) in notes.iter().enumerate() {
-        if resolver
+        let present = resolver
             .resolve(&n.guid)
             .map(|p| p.is_file())
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if present {
             disk_hits += 1;
         }
-        let (body_len, fp, body_text) = match note_body_text(&zip, &n.guid) {
-            Ok(v) => v,
-            Err(msg) => {
-                failed.push(format!("{}: {}", n.guid, msg));
-                (0, String::new(), String::new())
+        // **按需下载（cloud-only 库）**：清单有行、磁盘无包 = "尚未下载"，不是"解析失败"。
+        // 这里必须**不去开 zip**（开一个不存在的文件只会得到一条 Err），并把它记进
+        // `absent` 而不是 `failed` —— 否则 `failed` 会攒 1780 条、`ok` 恒 false，
+        // 索引报告看起来像整库损坏。正文留空，标题/目录照进索引（列表、树、标题检索可用）。
+        let (body_len, fp, body_text) = if present {
+            match note_body_text(&zip, &n.guid) {
+                Ok(v) => v,
+                Err(msg) => {
+                    failed.push(format!("{}: {}", n.guid, msg));
+                    (0, String::new(), String::new())
+                }
             }
+        } else {
+            absent += 1;
+            (0, String::new(), String::new())
         };
         put_note_row(
             &dst,
@@ -869,8 +879,20 @@ pub fn build_library_index(
         );
     }
 
-    // ---- 校验报告（库口径：清单行数 == 磁盘命中 == 索引 note 行数）----
-    let ok = manifest_count == disk_hits && failed.is_empty();
+    // ---- 校验报告（库口径：清单行数 == 磁盘命中 + 未下载；索引 note 行数 == 清单行数）----
+    //
+    // `ok` 不再要求 `disk_hits == manifest_count`：按需下载模式下"磁盘没有包"是**设计内**状态
+    // （清单有行、包在云端，打开该篇时由 `sync::fetch_note` 拉取）。判据只剩下"解析失败的篇 == 0"。
+    // 未下载篇数单独进 `warnings` —— 全量模式下它确实是异常（清单与磁盘脱节），
+    // 按需模式下它只是"还没拉过的篇"，同一句话把两种含义都说清楚。
+    let ok = failed.is_empty();
+    if absent > 0 {
+        warnings.push(format!(
+            "库索引一致性：清单 {manifest_count} 篇，磁盘命中 {disk_hits} 篇，\
+             **尚未下载 {absent} 篇**（按需下载模式下为正常态 —— 打开即拉取，正文暂不参与检索；\
+             全量模式下出现此项说明清单与磁盘脱节）"
+        ));
+    }
     if !ok {
         warnings.push(format!(
             "库索引一致性：清单 {manifest_count} 篇，磁盘命中 {disk_hits} 篇",
@@ -1080,13 +1102,23 @@ pub fn update_library_note_index(
                     .map_err(|e| e.to_string())?;
             }
             Some((g, title, location, url, doc_type, created, data_modified, has_att, size)) => {
-                let zip = ZipService::with_resolver(resolver as Arc<dyn NotePathResolver>);
-                let (body_len, fp, body_text) = match note_body_text(&zip, &g) {
-                    Ok(v) => v,
-                    Err(msg) => {
-                        warnings.push(format!("正文重抽失败（{msg}），该篇索引正文置空"));
-                        (0, String::new(), String::new())
+                // **按需下载**：清单有行、磁盘无包 ⇒ 没有正文可抽，正文列留空即可。
+                // 这一步必须发生在 `note_body_text` **之前**：开一个不存在的 zip 只会拿到 Err，
+                // 于是每次"远端只改了标题"的 metadata 下行都会往 UI 里塞一条
+                // 「正文重抽失败」—— 而它根本不是失败，只是这篇还没拉下来。
+                // 判据放在"文件在不在"这一层（与 `build_library_index` 同口径），与策略无关。
+                let present = resolver.resolve(&g).map(|p| p.is_file()).unwrap_or(false);
+                let (body_len, fp, body_text) = if present {
+                    let zip = ZipService::with_resolver(resolver as Arc<dyn NotePathResolver>);
+                    match note_body_text(&zip, &g) {
+                        Ok(v) => v,
+                        Err(msg) => {
+                            warnings.push(format!("正文重抽失败（{msg}），该篇索引正文置空"));
+                            (0, String::new(), String::new())
+                        }
                     }
+                } else {
+                    (0, String::new(), String::new())
                 };
                 ensure_folders(&dst, &location)?;
                 put_note_row(
@@ -1277,6 +1309,56 @@ mod tests {
             .query_row("SELECT package_size FROM note WHERE guid=?1", rusqlite::params![g1], |r| r.get(0))
             .unwrap();
         assert_eq!(psz, 10);
+
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// 按需下载（cloud-only）：清单有行、磁盘无包 ⇒ 索引**照旧出行**（列表/目录树要用），
+    /// 正文列留空、**不产生任何 warning**（它不是失败），FTS 也搜不到该篇。
+    ///
+    /// 变异检查：把 `update_library_note_index` 里那个 `present` 判据去掉（恢复成直接开 zip），
+    /// 本用例会在 `warns.is_empty()` 上变红（会得到「正文重抽失败（…）」）。
+    #[test]
+    fn test_index_absent_note_has_row_no_body_no_warning() {
+        let lib = std::env::temp_dir().join(format!("wiz-libindex-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(&lib).unwrap();
+
+        let g1 = "33333333-3333-3333-3333-333333333333";
+        // 只写清单行，**不写 zip** —— 这就是"按需模式下尚未下载"的形态
+        let conn = manifest::open_and_migrate(&lib).unwrap();
+        manifest::set_meta(&conn, "export_mode", "md").unwrap();
+        manifest::upsert_note(&conn, &mk_note(g1, "云端独有", "/工作/", "工作/云端独有.zip")).unwrap();
+        drop(conn);
+
+        let resolver = Arc::new(LibraryResolver::new(lib.clone()).unwrap());
+        let index_db = lib.join("derived-index.db");
+        let rep = build_library_index(&lib, resolver.clone(), &index_db, &|_, _| {}).unwrap();
+
+        assert!(rep.ok, "未下载不应判失败：warnings={:?}", rep.warnings);
+        assert_eq!(rep.note_count, 1);
+        assert_eq!(rep.package_count, 0, "磁盘上没有包");
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("尚未下载")),
+            "应有一条「尚未下载」说明：{:?}",
+            rep.warnings
+        );
+
+        let idx = Connection::open(&index_db).unwrap();
+        let (rows, body_len): (i64, i64) = idx
+            .query_row(
+                "SELECT count(*), ifnull(sum(body_text_length),0) FROM note WHERE guid=?1",
+                rusqlite::params![g1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "未下载的篇在索引里仍要有一行（列表/树靠它）");
+        assert_eq!(body_len, 0, "没包就没正文");
+        drop(idx);
+
+        // 单篇增量走同一条判据：包仍不在 ⇒ 重写行、正文空、**零 warning**
+        let warns = update_library_note_index(&lib, resolver.clone(), &index_db, g1).unwrap();
+        assert!(warns.is_empty(), "未下载的篇不该报「正文重抽失败」：{warns:?}");
 
         std::fs::remove_dir_all(&lib).unwrap();
     }

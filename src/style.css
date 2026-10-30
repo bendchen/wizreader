@@ -127,6 +127,8 @@ body.col-resizing {
   background: var(--bg-3); color: var(--text-2);
 }
 .badge.warn { color: var(--danger); }
+/* 按需下载：只在云端的篇（清单有行、包未落盘）。中性色 —— 这是**正常态**，不是告警 */
+.badge.cloud { color: var(--accent); }
 
 .reader-scroll { padding: 0 0 40px; }
 .info-bar {

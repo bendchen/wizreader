@@ -167,6 +167,11 @@ pub struct SyncReport {
     pub overwritten_remote: usize,
     #[serde(default)]
     pub failures: Vec<SyncFailure>,
+    /// **按需下载**：本轮**故意没下**的笔记包数（清单有行、策略要求"只同步数据库"）。
+    /// 它**不是失败**，也不是"跳过"（`skipped` 的语义是对象级续传命中）。
+    /// 全量模式下恒为 0。
+    #[serde(default)]
+    pub pending: usize,
     pub manifest_uploaded: bool,
     pub remote_revision: Option<u64>,
     pub local_revision: u64,
@@ -189,6 +194,7 @@ impl SyncReport {
             retried: 0,
             overwritten_remote: 0,
             failures: Vec::new(),
+            pending: 0,
             manifest_uploaded: false,
             remote_revision: None,
             local_revision: 0,
@@ -485,7 +491,10 @@ async fn sync_up_once(
     // （`local_srevs` 只在提交点被 `mark_notes_synced` 推进，故本端发出去的号必然 ≈ 本端手上的号。）
     // 附件行（步骤 2 组任务要用；这里提前读一份，只为判"本轮到底有没有东西要提交"）
     let atts = manifest::load_attachments(&conn)?;
-    let has_att_rows = atts.iter().any(|a| a.tier != 0);
+    // **按需下载**：本机可能根本没拉过附件 ⇒ "附件行在、本地文件不在"是常态，
+    // 既不能算失败（下面跳过），也不能当作"本轮有附件要提交"（否则每轮都白跑一次远端清单）。
+    let on_demand = cfg.notes_on_demand();
+    let has_att_rows = !on_demand && atts.iter().any(|a| a.tier != 0);
     let remote = if unsynced.is_empty() && unpublished_tombs.is_empty() && !has_att_rows {
         // 笔记无闩、墓碑无未发布、附件无实体行 ⇒ 本轮**不铸版不提交** ⇒ 一次网络都不打
         None
@@ -682,6 +691,10 @@ async fn sync_up_once(
         };
         let local = attach_local_path(root, &a.file_path);
         let Some(hex) = md5s.get(local.to_string_lossy().as_ref()) else {
+            if on_demand {
+                // 按需模式：这个附件还没随某篇笔记拉下来 ⇒ 本端"没有它"，不是"丢了它"
+                continue;
+            }
             report.failures.push(SyncFailure {
                 key: cloud_rel,
                 reason: format!("本地附件缺失: {}", local.display()),
@@ -1220,6 +1233,15 @@ pub async fn sync_down(
     let mut trash_candidates: Vec<(String, PathBuf)> = Vec::new(); // (guid, 本地旧落点)
     // 增量索引用：zip 被重新落盘的篇（新增/内容更新/改落点/文件缺失重下）
     let mut changed_guids: Vec<String> = Vec::new();
+    // **按需下载（cloud-only 库）**：清单照常同步，**一个笔记包都不下**。
+    //
+    // 这一分支只关"下载"，不动任何别的东西：
+    // - 清单已经在 2e 原子替换（"同步数据库"正是它）；
+    // - 删除传播（本地有 / 远端删 → `_trash`）、落点变更搬移照旧跑 —— 它们处理的是**本地已有**的包；
+    // - 清单位/闩/`synced_revision` 一个字节都不改（`local_keep` 的回写逻辑照常执行）。
+    // 结果：本地可能出现"清单有行、磁盘无包"，那是**未下载态**（不是缺失），
+    // 由 `fetch_note` 在用户点开该篇时补齐。
+    let on_demand = cfg.notes_on_demand();
     for n in notes.values() {
         let dest = root.join(&n.exported_path);
         // 本地清单里 md5 已与远端一致且文件在 → 无需下载
@@ -1228,7 +1250,12 @@ pub async fn sync_down(
             .get(&n.guid)
             .map(|p| p.exported_md5 == n.exported_md5)
             .unwrap_or(false);
-        if !(same && dest.is_file()) && !local_keep.contains(&n.guid) {
+        if on_demand {
+            // 没下过的篇计入 `pending`（可观察）；已下过的篇不重下、不覆盖、不再动。
+            if !(same && dest.is_file()) && !local_keep.contains(&n.guid) {
+                report.pending += 1;
+            }
+        } else if !(same && dest.is_file()) && !local_keep.contains(&n.guid) {
             // 注：writer 侧"本地脏且分歧"的篇（**含真冲突**）一律不下载 —— 本地版胜出：
             // 真冲突已把远端版旁置到 `_conflicts/`，后继式改动则原样留着等下次上行。
             // 两者的清单行都会在同一轮末被回写成**本地行**（见 3''）。
@@ -1287,108 +1314,32 @@ pub async fn sync_down(
 
     // 3b. 附件差集（Tier1–4 落盘；tier0 无文件）
     //
-    // **D5（LWW §3.6，2026-10-17 用户拍板）**：判据从「本地文件在不在」改成
-    // 「**本地 md5 ≠ 云端对象 md5 ⇒ 云端胜**」。旧判据下「B 本地已有同名附件 ⇒ 永远拉不到」
-    // （`if !local.exists()`），多写者下静默分叉且两侧都无副本。
-    // 新规则：不一致就**覆盖本地版**、**不旁置、不进 `_conflicts/`**。
-    // 代价（已登记 §6 第 4 条）：判据只有"一样/不一样"、没有"谁更新"⇒ 本端手改的附件会被覆盖，
-    // 且同步顺序是 down→up，本地改动连抢跑机会都没有。开放附件编辑前必须改判（附件行记 md5 ⇒ v7）。
-    let atts = manifest::load_attachments(&conn)?;
-    // 先算「应有落点 + 云端键」（含旧清单 cloud_key 未回填的兜底）
-    let mut att_cands: Vec<(String, PathBuf)> = Vec::new();
-    for a in &atts {
-        if a.tier == 0 {
-            continue; // db-missing：只有元数据行，没有文件可传/可下
-        }
-        let key_rel = match &a.cloud_key {
-            Some(k) => k.clone(),
-            None => {
-                let seg = match a.file_path.strip_prefix("attachments/") {
-                    Some(s) => s.to_string(),
-                    None => a.file_path.clone(),
-                };
-                if a.tier == 4 {
-                    format!("{KEY_NATIVE}/_unlinked_attachments/{seg}")
-                } else {
-                    format!("{KEY_NATIVE}/attachments/{seg}")
-                }
-            }
-        };
-        // cloud_key 为完整对象键（相对 prefix）；本地按**库内保留区**落盘（A1'：`_attachments/…`）
-        att_cands.push((
-            att_object_key(cfg, &key_rel),
-            root.join(manifest::disk_rel_path(&a.file_path)),
-        ));
-    }
-    // 本地已有文件的 md5 一次性批量算（与上行同一路子，`spawn_blocking`；总量 ~14 MB）
-    let local_paths: Vec<PathBuf> = att_cands
-        .iter()
-        .filter(|(_, p)| p.is_file())
-        .map(|(_, p)| p.clone())
-        .collect();
-    let local_md5s: HashMap<String, String> = crate::commands::spawn_blocking(move || {
-        let mut m = HashMap::new();
-        for p in local_paths {
-            if let Ok(h) = manifest::md5_file(&p) {
-                m.insert(p.to_string_lossy().to_string(), h);
-            }
-        }
-        m
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // 每个附件一次 HEAD 取云端 `content-md5`（与上行 `sync.rs` 的 HEAD 判跳过同一取法）。
-    // 之所以逐个小对象 HEAD：附件在清单里**不带 md5**，云端指纹只能现场问；带并发，代价可接受。
-    let md5_lookup = &local_md5s;
-    let heads = stream::iter(att_cands.into_iter().map(|(key, local)| {
-        let md5_lookup = md5_lookup;
-        async move {
-            let local_md5 = md5_lookup
-                .get(local.to_string_lossy().as_ref())
-                .cloned();
-            let cloud_md5 = match store.head(&key).await {
-                Ok(Some(h)) => h.meta("content-md5").cloned(),
-                Ok(None) => None, // 清单有行、对象不在：不主动删本地（宁可留着也不凭空毁数据）
-                Err(e) => return Err((key, format!("HEAD 失败: {e}"))),
-            };
-            Ok::<_, (String, String)>((key, local, local_md5, cloud_md5))
-        }
-    }))
-    .buffer_unordered(cfg.concurrency.max(1) as usize)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut att_downloads: Vec<(String, PathBuf)> = Vec::new();
-    let mut att_overwritten = 0usize;
-    for h in heads {
-        match h {
-            Ok((key, local, local_md5, cloud_md5)) => {
-                let need = match (&local_md5, &cloud_md5) {
-                    (None, _) => true,             // 本地没有 ⇒ 下载
-                    (Some(_), None) => false,      // 云端没有对象 ⇒ 保住本地
-                    (Some(l), Some(c)) => l != c,  // D5：不一致 ⇒ 云端胜
-                };
-                if need {
-                    if local_md5.is_some() {
-                        att_overwritten += 1;
-                    }
-                    att_downloads.push((key, local));
-                }
-            }
-            Err((key, e)) => report.failures.push(SyncFailure {
-                key,
-                reason: e,
-                retryable: true,
-            }),
-        }
-    }
+    // **按需下载**：附件也是"笔记内容"，同样懒加载 —— 不在这里全库拉，
+    // 改由 `fetch_note` 在打开某篇时只拉**该篇的**附件。故本步整体跳过。
+    let (att_downloads, att_overwritten, att_head_failures) = if on_demand {
+        (Vec::new(), 0usize, Vec::new())
+    } else {
+        let cands = attachment_download_candidates(cfg, root, &conn)?;
+        plan_attachment_downloads(store, cfg, cands).await?
+    };
+    report.failures.extend(att_head_failures);
     if !att_downloads.is_empty() {
         crate::commands::append_sync_log(&format!(
             "附件差集：{} 个待下载（判据 = 本地 md5 ≠ 云端 content-md5；其中 {} 个是**云端胜**、\
              覆盖本地版，不旁置）",
             att_downloads.len(),
             att_overwritten
+        ));
+    }
+
+    if on_demand {
+        crate::commands::append_sync_log(&format!(
+            "按需下载：本轮只同步清单（revision {} → {}），未下载任何笔记包（{} 篇待按需拉取；\
+             本地已在的 {} 篇不动）",
+            report.local_revision,
+            remote_rev,
+            report.pending,
+            notes.len().saturating_sub(report.pending)
         ));
     }
 
@@ -1531,6 +1482,395 @@ async fn local_revision(root: &Path) -> u64 {
     }
 }
 
+/// 附件差集的**候选清单**：`(云端对象键, 本地落点)`。
+///
+/// 同步函数、**不碰网络**：`rusqlite::Connection` 不是 `Sync`，把它借进 async 函数会让
+/// `#[tauri::command]` 那层要求 `Future: Send` 直接编译失败（实测报
+/// `RefCell<LruCache>` 未实现 `Sync`）。故"读清单"这一步留在同步侧做完，只把纯数据交给 async。
+fn attachment_download_candidates(
+    cfg: &SyncSettings,
+    root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let atts = manifest::load_attachments(conn)?;
+    // 先算「应有落点 + 云端键」（含旧清单 cloud_key 未回填的兜底）
+    let mut att_cands: Vec<(String, PathBuf)> = Vec::new();
+    for a in &atts {
+        if a.tier == 0 {
+            continue; // db-missing：只有元数据行，没有文件可传/可下
+        }
+        let key_rel = att_cloud_rel(&a.file_path, a.tier, a.cloud_key.as_deref());
+        // cloud_key 为完整对象键（相对 prefix）；本地按**库内保留区**落盘（A1'：`_attachments/…`）
+        att_cands.push((
+            att_object_key(cfg, &key_rel),
+            root.join(manifest::disk_rel_path(&a.file_path)),
+        ));
+    }
+    Ok(att_cands)
+}
+
+/// 附件差集（Tier1–4）：算出"要下哪些对象 + 各自落点"，顺带给出 HEAD 失败项。
+///
+/// 从 `sync_down` 里抽出来只为**让按需下载能整段跳过**（原来它和数据/索引逻辑缠在同一个
+/// 函数体里，加个 `if` 会把它包成 90 行的条件块，读的人分不清哪段是"下行"哪段是"附件"）。
+///
+/// **D5（LWW §3.6，2026-10-17 用户拍板）**：判据从「本地文件在不在」改成
+/// 「**本地 md5 ≠ 云端对象 md5 ⇒ 云端胜**」。旧判据下「B 本地已有同名附件 ⇒ 永远拉不到」
+/// （`if !local.exists()`），多写者下静默分叉且两侧都无副本。
+/// 新规则：不一致就**覆盖本地版**、**不旁置、不进 `_conflicts/`**。
+/// 代价（已登记 §6 第 4 条）：判据只有"一样/不一样"、没有"谁更新"⇒ 本端手改的附件会被覆盖，
+/// 且同步顺序是 down→up，本地改动连抢跑机会都没有。开放附件编辑前必须改判（附件行记 md5 ⇒ v7）。
+async fn plan_attachment_downloads(
+    store: &dyn ObjectStore,
+    cfg: &SyncSettings,
+    att_cands: Vec<(String, PathBuf)>,
+) -> Result<(Vec<(String, PathBuf)>, usize, Vec<SyncFailure>), String> {
+    // 本地已有文件的 md5 一次性批量算（与上行同一路子，`spawn_blocking`；总量 ~14 MB）
+    let local_paths: Vec<PathBuf> = att_cands
+        .iter()
+        .filter(|(_, p)| p.is_file())
+        .map(|(_, p)| p.clone())
+        .collect();
+    let local_md5s: HashMap<String, String> = crate::commands::spawn_blocking(move || {
+        let mut m = HashMap::new();
+        for p in local_paths {
+            if let Ok(h) = manifest::md5_file(&p) {
+                m.insert(p.to_string_lossy().to_string(), h);
+            }
+        }
+        m
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 每个附件一次 HEAD 取云端 `content-md5`（与上行 `sync.rs` 的 HEAD 判跳过同一取法）。
+    // 之所以逐个小对象 HEAD：附件在清单里**不带 md5**，云端指纹只能现场问；带并发，代价可接受。
+    let md5_lookup = &local_md5s;
+    let heads = stream::iter(att_cands.into_iter().map(|(key, local)| {
+        let md5_lookup = md5_lookup;
+        async move {
+            let local_md5 = md5_lookup
+                .get(local.to_string_lossy().as_ref())
+                .cloned();
+            let cloud_md5 = match store.head(&key).await {
+                Ok(Some(h)) => h.meta("content-md5").cloned(),
+                Ok(None) => None, // 清单有行、对象不在：不主动删本地（宁可留着也不凭空毁数据）
+                Err(e) => return Err((key, format!("HEAD 失败: {e}"))),
+            };
+            Ok::<_, (String, String)>((key, local, local_md5, cloud_md5))
+        }
+    }))
+    .buffer_unordered(cfg.concurrency.max(1) as usize)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut att_downloads: Vec<(String, PathBuf)> = Vec::new();
+    let mut att_overwritten = 0usize;
+    let mut failures: Vec<SyncFailure> = Vec::new();
+    for h in heads {
+        match h {
+            Ok((key, local, local_md5, cloud_md5)) => {
+                let need = match (&local_md5, &cloud_md5) {
+                    (None, _) => true,             // 本地没有 ⇒ 下载
+                    (Some(_), None) => false,      // 云端没有对象 ⇒ 保住本地
+                    (Some(l), Some(c)) => l != c,  // D5：不一致 ⇒ 云端胜
+                };
+                if need {
+                    if local_md5.is_some() {
+                        att_overwritten += 1;
+                    }
+                    att_downloads.push((key, local));
+                }
+            }
+            Err((key, reason)) => failures.push(SyncFailure {
+                key,
+                reason,
+                retryable: true,
+            }),
+        }
+    }
+    Ok((att_downloads, att_overwritten, failures))
+}
+
+/// 附件云端对象键（**相对 prefix**）：清单 `cloud_key` 优先；未回填时按 tier + `file_path` 推。
+///
+/// 抽成函数是因为"按需拉取"与"全库下行"必须用**同一个键**：两处各写一遍，
+/// 一旦推法分叉，症状是"全量下行能拿到附件、按需拉取 404"。
+fn att_cloud_rel(file_path: &str, tier: i64, stored: Option<&str>) -> String {
+    if let Some(k) = stored {
+        return k.to_string();
+    }
+    let seg = match file_path.strip_prefix("attachments/") {
+        Some(s) => s.to_string(),
+        None => file_path.to_string(),
+    };
+    if tier == 4 {
+        format!("{KEY_NATIVE}/_unlinked_attachments/{seg}")
+    } else {
+        format!("{KEY_NATIVE}/attachments/{seg}")
+    }
+}
+
+/// 单篇拉取结果（`note_fetch` 的返回体）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchReport {
+    pub guid: String,
+    /// false = 本地本来就有（且与清单一致）⇒ **零网络**
+    pub fetched: bool,
+    pub bytes: u64,
+    /// 本篇随之拉下的附件数
+    pub attachments: usize,
+    /// 派生索引是否已补齐该篇正文（false = 见 `warnings`；**不是**拉取失败）
+    pub index_updated: bool,
+    pub warnings: Vec<String>,
+}
+
+/// **按需下载**：把清单里的一篇从云端拉到本地（含它的附件），并补齐派生索引。
+///
+/// 调用时机 = 用户选中一篇笔记（`Reader.vue` 在渲染 iframe **之前**）。它是"打开一篇"的
+/// 预热，不是"同步"：**不改清单一个字**（不置脏、不铸版、不碰 `synced_revision`），
+/// 因而绝不会把本机误标成"有待上行内容"，也不会推高任何水位。
+///
+/// 判据（按顺序）：
+/// 1. 清单无此行 ⇒ `NOTE_NOT_FOUND`（本地库根本没见过这一篇）；
+/// 2. 本地已有该包且**体积 + MD5 都与清单相符** ⇒ `fetched=false` 直接返回（**零网络**）；
+/// 3. 本地该行**脏**（`dirty_info`/`dirty_data`）⇒ 绝不覆盖，带 warning 返回 ——
+///    那是本机还没上行的改动，用云端版盖掉就是静默丢数据；
+/// 4. 否则 `GET native/notes/{GUID}` → **校验 MD5** → 原子落盘。
+///
+/// `store == None`（云同步未启用/未初始化）**只在第 4 步才致命**：读一篇本机已有的笔记
+/// 不该被"没配云"挡住 —— 那样按需模式会让整个库在断网/未配置时全黑。
+///
+/// 为什么第 4 步必须校验 MD5：清单描述的是"这一篇应该是什么"，云端对象是"实际给了什么"。
+/// 两者不一致时若照写，读路径会拿到一篇**内容与清单不符**的笔记，`verify-library --deep`
+/// 事后才报——那时已经不知道是哪一步写坏的。
+pub async fn fetch_note(
+    store: Option<&dyn ObjectStore>,
+    cfg: &SyncSettings,
+    root: &Path,
+    index_db: &Path,
+    guid: &str,
+) -> Result<FetchReport, String> {
+    let g = guid.trim().trim_matches(['{', '}']).to_string();
+    let conn = manifest::open_readonly(root)?;
+    let note = manifest::load_one_note(&conn, &g)?
+        .ok_or_else(|| format!("NOTE_NOT_FOUND: 清单里没有 {g}（可能已被删除或本机尚未下行）"))?;
+    if crate::library::is_unsafe_rel_path(&note.exported_path) {
+        return Err(format!("PATH_UNSAFE: 清单落点不安全 {}", note.exported_path));
+    }
+    let dest = root.join(&note.exported_path);
+    let mut rep = FetchReport {
+        guid: g.clone(),
+        fetched: false,
+        bytes: 0,
+        attachments: 0,
+        index_updated: false,
+        warnings: Vec::new(),
+    };
+
+    // —— 本地已有？体积先行（一次 stat），相符再算 MD5（避免把截断包当成"已下载"）
+    let size_ok = std::fs::metadata(&dest)
+        .map(|m| m.is_file() && m.len() as i64 == note.exported_size)
+        .unwrap_or(false);
+    let already = size_ok
+        && match manifest::md5_file(&dest) {
+            Ok(h) => note.exported_md5.is_empty() || h == note.exported_md5,
+            Err(_) => false,
+        };
+    if already {
+        rep.index_updated = refresh_one_note_index_async(root, index_db, &g, &mut rep.warnings).await;
+        return Ok(rep);
+    }
+
+    // —— 本机脏 ⇒ 不覆盖。本地文件在就说"已在本机（有未上行改动）"，不在则明确报缺。
+    let dirty = manifest::load_unsynced_note_guids(&conn)?.contains(&g);
+    if dirty {
+        if dest.is_file() {
+            rep.warnings.push(
+                "本机这一篇有未同步的改动，未用云端版覆盖（先上行，或到写入端处理）".to_string(),
+            );
+            rep.index_updated = refresh_one_note_index_async(root, index_db, &g, &mut rep.warnings).await;
+            return Ok(rep);
+        }
+        return Err(format!(
+            "NOTE_PACKAGE_MISSING: {g} 有未上行的改动但磁盘上没有包（清单 {}）——请在写入端恢复后再同步",
+            note.exported_path
+        ));
+    }
+
+    // —— 拉对象 → 校验 → 原子落盘
+    let store = store.ok_or_else(|| {
+        format!(
+            "SYNC_DISABLED: {g} 还没下载到本机，而云同步未启用/未初始化 —— 无法从云端拉取\
+             （本地已下载的篇不受影响）"
+        )
+    })?;
+    let key = cfg.cloud_key(&format!("{KEY_NATIVE}/notes/{}", braced(&g)));
+    let bytes = store
+        .get(&key)
+        .await
+        .map_err(|e| format!("SYNC_NOTE_FETCH_FAILED: 云端对象读取失败（{key}）: {e}"))?;
+    let actual = format!("{:x}", Md5::digest(&bytes));
+    if !note.exported_md5.is_empty() && actual != note.exported_md5 {
+        return Err(format!(
+            "SYNC_NOTE_MD5_MISMATCH: 云端对象 {actual} ≠ 清单 {}（{key}）——\
+             拒写，避免把一个与清单不符的包落到本地",
+            note.exported_md5
+        ));
+    }
+    let nbytes = bytes.len() as u64;
+    crate::commands::spawn_blocking({
+        let dest = dest.clone();
+        move || write_atomic(&dest, &bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    rep.fetched = true;
+    rep.bytes = nbytes;
+
+    // —— 随篇附件（best effort：附件拉失败不该让"读正文"失败）
+    //    先同步读出该篇的附件行（同上：`&Connection` 不能进 async），再交给 async 去拉。
+    let att_rows = note_attachment_rows(&conn, &g);
+    drop(conn);
+    let (n_att, att_warns) = fetch_note_attachments(store, cfg, root, att_rows).await;
+    rep.attachments = n_att;
+    rep.warnings.extend(att_warns);
+
+    rep.index_updated = refresh_one_note_index_async(root, index_db, &g, &mut rep.warnings).await;
+    crate::commands::append_sync_log(&format!(
+        "按需拉取 {g} → {}（{} B，附件 {} 个，索引{}）",
+        note.exported_path,
+        rep.bytes,
+        rep.attachments,
+        if rep.index_updated { "已补齐" } else { "未补齐" }
+    ));
+    Ok(rep)
+}
+
+/// [`refresh_one_note_index`] 的异步包装（本地 SQLite + 开 zip ⇒ 离开 async 线程）。
+async fn refresh_one_note_index_async(
+    root: &Path,
+    index_db: &Path,
+    guid: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let lib = root.to_path_buf();
+    let idx = index_db.to_path_buf();
+    let g = guid.to_string();
+    let res = crate::commands::spawn_blocking(move || {
+        let mut w = Vec::new();
+        let ok = refresh_one_note_index(&lib, &idx, &g, &mut w);
+        (ok, w)
+    })
+    .await;
+    match res {
+        Ok((ok, ws)) => {
+            warnings.extend(ws);
+            ok
+        }
+        Err(e) => {
+            warnings.push(format!("单篇索引更新任务失败: {e}"));
+            false
+        }
+    }
+}
+
+/// 单篇索引补齐：正文刚到本地，索引里那一行必须补上（否则"打开即读"而"搜不到"）。
+///
+/// 失败**不致命**：包已经落盘，读路径正常；索引可随时重建。故返回 bool + 一条 warning。
+fn refresh_one_note_index(
+    root: &Path,
+    index_db: &Path,
+    guid: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if !index_db.is_file() {
+        warnings.push("派生索引尚未构建，本篇正文暂未进检索（可在设置里重建索引）".to_string());
+        return false;
+    }
+    let lib = root.to_path_buf();
+    let idx = index_db.to_path_buf();
+    let g = guid.to_string();
+    match crate::library::LibraryResolver::new(lib.clone()) {
+        Ok(r) => match crate::indexer::update_library_note_index(&lib, Arc::new(r), &idx, &g) {
+            Ok(ws) => {
+                warnings.extend(ws);
+                true
+            }
+            Err(e) => {
+                warnings.push(format!("单篇索引更新失败（重建索引即可修复）: {e}"));
+                false
+            }
+        },
+        Err(e) => {
+            warnings.push(format!("清单不可读，单篇索引未更新: {e}"));
+            false
+        }
+    }
+}
+
+/// 该篇的附件行：`(file_path, tier, cloud_key)`（`attachment` 直挂 + `attachment_doc` 多归属）。
+///
+/// 同步读、不进 async：`rusqlite::Connection` 不是 `Sync`，把它借进 async 函数会让上层的
+/// `Future: Send` 边界直接编译失败。
+fn note_attachment_rows(
+    conn: &rusqlite::Connection,
+    guid: &str,
+) -> Result<Vec<(String, i64, Option<String>)>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT file_path, tier, cloud_key FROM attachment WHERE document_guid = ?1
+             UNION
+             SELECT a.file_path, a.tier, a.cloud_key
+             FROM attachment a JOIN attachment_doc d ON a.file_path = d.file_path
+             WHERE d.document_guid = ?1",
+        )
+        .map_err(|e| format!("附件清单不可读（正文已拉到，附件未拉）: {e}"))?;
+    let rows = st
+        .query_map([guid], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(rows)
+}
+
+/// 把**某一篇**的附件从云端拉到本地（按需下载的"随篇"部分）。
+///
+/// 与 [`plan_attachment_downloads`] 的区别：范围只限这一篇，且**不做 D5 的"云端胜"覆盖** ——
+/// 本地已有同名文件就跳过（本机上的那份可能是用户在别处改过的，覆盖收益远小于风险）。
+/// 返回 `(成功拉取数, warnings)`；**永不失败**（正文已经拉到，附件是加分项）。
+async fn fetch_note_attachments(
+    store: &dyn ObjectStore,
+    cfg: &SyncSettings,
+    root: &Path,
+    rows: Result<Vec<(String, i64, Option<String>)>, String>,
+) -> (usize, Vec<String>) {
+    let mut warnings: Vec<String> = Vec::new();
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return (0, vec![e]),
+    };
+    let mut n = 0usize;
+    for (file_path, tier, cloud_key) in rows {
+        if tier == 0 {
+            continue; // db-missing：只有元数据，云端也没有对象
+        }
+        let dest = root.join(manifest::disk_rel_path(&file_path));
+        if dest.is_file() {
+            continue; // 已有就不动（见函数头注释）
+        }
+        let key = att_object_key(cfg, &att_cloud_rel(&file_path, tier, cloud_key.as_deref()));
+        match store.get(&key).await {
+            Ok(bytes) => match write_atomic(&dest, &bytes) {
+                Ok(()) => n += 1,
+                Err(e) => warnings.push(format!("附件落盘失败（{file_path}）: {e}")),
+            },
+            Err(e) => warnings.push(format!("附件拉取失败（{file_path}）: {e}")),
+        }
+    }
+    (n, warnings)
+}
+
 // ---------------------------------------------------------------- 首次初始化（§8.3）
 
 /// 写入端初始化（§7.3）：**校验库就绪 → 全量上行**（U2 后不再有"先导出"这一步）。
@@ -1559,6 +1899,24 @@ pub async fn bootstrap_export(
     // SYNC_NO_MANIFEST、up 永远无动作，客户端卡死在"已初始化的空远端"上）。
     // 初始化的语义是「把本库完整铸版为远端 rev1」⇒ 远端无清单时全库置脏再上行。
     if fetch_remote_manifest(store, cfg, root).await?.is_none() {
+        // 按需模式的这台机器**没有**笔记包可当"云端初始来源"：清单是全的、包几乎一个都没有。
+        // 此时"全库置脏再上行"只会得到成片的"文件不存在"，还会把云端铸成一份指向空对象的清单。
+        if cfg.notes_on_demand() {
+            let conn = manifest::open_readonly(root)?;
+            let notes = manifest::load_notes(&conn)?;
+            let present = notes
+                .values()
+                .filter(|n| root.join(&n.exported_path).is_file())
+                .count();
+            if !notes.is_empty() && present == 0 {
+                return Err(format!(
+                    "SYNC_INIT_NEEDS_LOCAL_NOTES: 本机是「笔记下载=按需」且 {} 篇笔记一个都没下载 —— \
+                     不能作为云端的初始来源。请在**全量**模式（或已有完整库的那台机器）上初始化云端，\
+                     本机随后同步即可",
+                    notes.len()
+                ));
+            }
+        }
         let conn = manifest::open_and_migrate(root)?;
         let n = manifest::mark_all_notes_dirty(&conn)?;
         let a = manifest::mark_all_attachments_dirty(&conn)?;
@@ -3429,5 +3787,232 @@ mod tests {
         let d2 = sync_down(&store, &cfg_of(&a), &a, p).await.unwrap();
         assert_eq!(d2.downloaded, 1, "只该拉那篇笔记：附件 md5 一致 ⇒ 一个 GET 都不发");
         assert_eq!(std::fs::read(&local_a).unwrap(), b"CLOUD-NEW");
+    }
+
+    // ---------------------------------------------------------------- 按需下载（cloud-only 库）
+
+    /// 按需策略的 cfg（其余字段与 [`cfg_of`] 一致，`local_root` 仍指向不存在目录 ⇒ 反向验证
+    /// "没有任何一行代码偷看它"）。
+    fn cfg_ondemand(root: &Path) -> SyncSettings {
+        SyncSettings {
+            download_policy: crate::config::POLICY_ON_DEMAND.into(),
+            ..cfg_of(root)
+        }
+    }
+
+    fn index_note_count(db: &Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM note", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn fts_hits(db: &Path, kw: &str) -> i64 {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM note_fts WHERE note_fts MATCH ?1",
+                [kw],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 造一个"两端都在"的场景：A 已有两篇并全量上行，B 用**按需策略**首次下行。
+    /// 返回 `(a, b, store, cfg_b, index_db_b, guid1, guid2)`。
+    async fn setup_on_demand(tag: &str) -> (PathBuf, PathBuf, MemStore, SyncSettings, PathBuf, String, String) {
+        let a = temp_root(&format!("od-a-{tag}"));
+        let b = temp_root(&format!("od-b-{tag}"));
+        let g1 = "11111111-2222-3333-4444-777777777777";
+        let g2 = "22222222-3333-4444-5555-888888888888";
+        seed_manifest(&a, g1, "<html><body>苹果 bluestore 集群</body></html>");
+        add_note(&a, g2, "m", "<html><body>乙篇 蓝鲸乙</body></html>");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p).await.unwrap();
+        let cfg_b = cfg_ondemand(&b);
+        let idx = crate::config::index_file_for_library(&b);
+        (a, b, store, cfg_b, idx, g1.into(), g2.into())
+    }
+
+    /// **核心口径**：按需模式下 `sync_down` = **只同步数据库（清单）**。
+    ///
+    /// 断言四件事，少一件都会让"本地没有笔记、都在云端"变成半成品：
+    /// ① 一个笔记包都不落盘；② 清单已替换且水位已对齐；③ 索引里**篇数齐全**（树/列表可用）；
+    /// ④ 未下载篇的正文**不在** FTS 里（这是按需模式的固有代价，必须显式承认而不是假装能搜）。
+    #[tokio::test]
+    async fn test_down_on_demand_syncs_manifest_only() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let (a, b, store, cfg_b, idx, g1, g2) = setup_on_demand("down").await;
+        let p = noop_progress();
+
+        let rep = sync_down(&store, &cfg_b, &b, p.clone()).await.unwrap();
+        assert_eq!(rep.direction, "down");
+        assert_eq!(rep.downloaded, 0, "按需模式：一个笔记包都不下");
+        assert_eq!(rep.pending, 2, "两篇都记入「待按需拉取」");
+        assert!(rep.failures.is_empty(), "{:?}", rep.failures);
+
+        // ② 清单在，且水位与远端一致
+        assert!(b.join(manifest::MANIFEST_NAME).is_file(), "清单必须已同步（这就是「数据库」）");
+        let local_rev = {
+            let c = manifest::open_readonly(&b).unwrap();
+            manifest::current_revision(&c)
+        };
+        assert_eq!(local_rev, rep.remote_revision.unwrap(), "下行对齐水位（不铸版）");
+
+        // ① 磁盘上没有包
+        for g in [&g1, &g2] {
+            let rel = exported_path_of(&a, g);
+            assert!(
+                !b.join(&rel).exists(),
+                "按需模式下不得落盘: {rel}（否则就不是「本地没有笔记」）"
+            );
+        }
+
+        // ③ 索引篇数齐全（清单直接作为输入）；④ 正文未进 FTS
+        assert_eq!(index_note_count(&idx), 2, "树/列表要能列出全部篇目");
+        assert_eq!(
+            fts_hits(&idx, "bluestore"),
+            0,
+            "未下载篇的正文不可检索（按需模式的固有代价，拉取后才补上）"
+        );
+    }
+
+    /// 打开一篇 ⇒ 只把**这一篇**从云端拉下来，并补上它的正文索引；
+    /// **清单一个字节都不改**（不置脏、不铸版）。
+    #[tokio::test]
+    async fn test_fetch_note_pulls_one_package_and_indexes_body() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let (a, b, store, cfg_b, idx, g1, g2) = setup_on_demand("fetch").await;
+        let p = noop_progress();
+        sync_down(&store, &cfg_b, &b, p).await.unwrap();
+
+        let rel1 = exported_path_of(&a, &g1);
+        let expect_bytes = std::fs::read(a.join(&rel1)).unwrap();
+        let manifest_before = std::fs::read(manifest::manifest_path(&b)).unwrap();
+
+        let rep = fetch_note(Some(&store), &cfg_b, &b, &idx, &g1).await.unwrap();
+        assert!(rep.fetched, "首次拉取应真的下载");
+        assert_eq!(rep.bytes, expect_bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(b.join(&rel1)).unwrap(),
+            expect_bytes,
+            "落盘字节与云端逐字节一致"
+        );
+        assert!(rep.index_updated, "拉完要补该篇正文索引: {:?}", rep.warnings);
+        assert_eq!(fts_hits(&idx, "bluestore"), 1, "正文已可检索");
+
+        // 另一篇**不受影响**（"只拉被选中的那一篇"）
+        assert!(!b.join(exported_path_of(&a, &g2)).exists(), "不得顺手把别的篇也拉下来");
+
+        // 清单零改动：既不置脏，也不铸版
+        assert_eq!(
+            std::fs::read(manifest::manifest_path(&b)).unwrap(),
+            manifest_before,
+            "拉取是「读」，不是「同步」—— 清单必须一个字节都不变"
+        );
+    }
+
+    /// 本地已有 ⇒ **零网络**：把 store 抽掉（`None`）也必须成功。
+    #[tokio::test]
+    async fn test_fetch_note_is_zero_network_when_already_local() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let (_a, b, store, cfg_b, idx, g1, _g2) = setup_on_demand("local").await;
+        let p = noop_progress();
+        sync_down(&store, &cfg_b, &b, p).await.unwrap();
+        let _ = fetch_note(Some(&store), &cfg_b, &b, &idx, &g1).await.unwrap();
+
+        // `None` = 根本没有对象存储可用；能成功就证明这条路一次网络都没打
+        let rep = fetch_note(None, &cfg_b, &b, &idx, &g1).await.unwrap();
+        assert!(!rep.fetched);
+        assert_eq!(rep.bytes, 0);
+        assert_eq!(rep.attachments, 0);
+    }
+
+    /// 云端对象与清单 MD5 不符 ⇒ **拒写**（否则本地会静默拿到一篇"内容与清单不符"的笔记）。
+    #[tokio::test]
+    async fn test_fetch_note_rejects_md5_mismatch() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let (a, b, store, cfg_b, idx, g1, _g2) = setup_on_demand("md5").await;
+        let p = noop_progress();
+        sync_down(&store, &cfg_b, &b, p).await.unwrap();
+
+        // 用同一把对象键换掉云端字节（模拟"云端被写坏 / 键指向了别的对象"）
+        let key = cfg_b.cloud_key(&format!("{KEY_NATIVE}/notes/{}", braced(&g1)));
+        store.put_bytes(&key, b"tampered-bytes", &[]).await.unwrap();
+
+        let err = fetch_note(Some(&store), &cfg_b, &b, &idx, &g1)
+            .await
+            .unwrap_err();
+        assert!(err.contains("SYNC_NOTE_MD5_MISMATCH"), "{err}");
+        assert!(
+            !b.join(exported_path_of(&a, &g1)).exists(),
+            "校验失败必须**不落盘**（不留半成品）"
+        );
+    }
+
+    /// 本机这一篇**脏**（还没上行）且磁盘上的包与清单不符 ⇒ **绝不覆盖**。    /// 这是按需模式最危险的一条：拉取看着像"补下载"，一覆盖就是静默丢数据。
+    #[tokio::test]
+    async fn test_fetch_note_never_overwrites_dirty_local() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let (a, b, store, cfg_b, idx, g1, _g2) = setup_on_demand("dirty").await;
+        let p = noop_progress();
+        sync_down(&store, &cfg_b, &b, p).await.unwrap();
+        fetch_note(Some(&store), &cfg_b, &b, &idx, &g1).await.unwrap();
+
+        // 走真实写路径置脏（闩由库内写路径置，不手工伪造）
+        local_write(&b, &g1, "<html><body>本机未上行的改动</body></html>");
+        let rel = exported_path_of(&b, &g1);
+        let pkg = b.join(&rel);
+        // 模拟"脏 + 磁盘与清单不符"（崩溃留下的半截文件 / 外部改坏）
+        std::fs::write(&pkg, b"half-written").unwrap();
+        let before = std::fs::read(&pkg).unwrap();
+
+        let rep = fetch_note(Some(&store), &cfg_b, &b, &idx, &g1).await.unwrap();
+        assert!(!rep.fetched, "脏篇不得被云端版覆盖");
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("未同步")),
+            "必须如实说明为什么没拉: {:?}",
+            rep.warnings
+        );
+        assert_eq!(std::fs::read(&pkg).unwrap(), before, "本地文件一个字节都不能动");
+        let _ = a;
+    }
+
+    /// 按需模式下 `sync_up` **不能**把"附件还没下载"报成失败。
+    ///
+    /// 这是按需下载最容易漏的一处：附件任务的原判据是"本地文件缺失 ⇒ failure"，全量模式下
+    /// 那是真异常，按需模式下那是**常态** —— 漏了它，每次保存后的自动同步都会弹一串失败。
+    #[tokio::test]
+    async fn test_up_on_demand_does_not_report_missing_attachments() {
+        let _s = crate::library::test_write_lock();
+        isolate_wiz_home();
+        let a = temp_root("od-up-a");
+        let b = temp_root("od-up-b");
+        let guid = "33333333-4444-5555-6666-999999999999";
+        seed_manifest(&a, guid, "<html><body>带附件的一篇</body></html>");
+        let (_fp, local_att, _key) = seed_attachment(&a, "pic.bin", b"ATT-BYTES");
+        let store = MemStore::new();
+        let p = noop_progress();
+        sync_up(&store, &cfg_of(&a), &a, p.clone()).await.unwrap();
+
+        let cfg_b = cfg_ondemand(&b);
+        sync_down(&store, &cfg_b, &b, p.clone()).await.unwrap();
+        let att_b = b.join(manifest::disk_rel_path("attachments/pic.bin"));
+        assert!(!att_b.exists(), "按需模式下行不拉附件（随笔记一起才有）");
+        let _ = &local_att;
+
+        let up = sync_up(&store, &cfg_b, &b, p).await.unwrap();
+        assert_eq!(up.direction, "none", "没有脏笔记 ⇒ 空跑");
+        assert!(
+            up.failures.is_empty(),
+            "附件没下载是常态，不得报失败: {:?}",
+            up.failures
+        );
     }
 }

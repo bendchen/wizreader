@@ -395,6 +395,8 @@ pub fn run() {
             // U1：`pick_sync_root` 已删（同步根恒为库根，唯一可选的是 `pick_library_dir`）
             commands::init_cloud_sync,
             commands::run_sync,
+            // 按需下载：打开某篇时把它（含附件）从云端拉到本地
+            commands::note_fetch,
             commands::get_sync_status,
             commands::run_startup_tasks,
             commands::list_trash,

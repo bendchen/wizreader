@@ -338,6 +338,9 @@ pub async fn save_sync_config(
     let user = crate::credential::credential_user(&config.endpoint, &config.bucket, &config.normalized_prefix());
     let mut cfg = config.clone();
     cfg.credential_user = user.clone();
+    // 下行策略归一：UI 送空串/未知值时落成 `full`（与 `migrate_settings` 同一口径，
+    // 免得"设置里写着按需、实际按全量跑"这种两极分叉）
+    cfg.download_policy = crate::config::canonical_policy(&cfg.download_policy).to_string();
 
     let old_user = state.settings.lock().unwrap().sync.credential_user.clone();
     if let Some(sk) = &secret_key {
@@ -464,6 +467,66 @@ pub async fn run_sync(
         "down" => crate::sync::sync_down(&*store, &cfg, &root, progress).await,
         other => Err(format!("SYNC_CONFIG_INVALID: direction 只能是 up/down，收到 {other}")),
     }
+}
+
+/// **按需下载**：把清单里的一篇（含它的附件）从云端拉到本地，并补齐派生索引。
+///
+/// 前端触发点 = 选中一篇笔记（`Reader.vue` 在渲染 `wiznote://` iframe **之前**）。
+/// 语义要点（详见 `sync::fetch_note`）：
+/// - **本地已在 ⇒ 零网络**（体积 + MD5 与清单相符即返回 `fetched=false`）；
+/// - **不改清单**（不置脏/不铸版）⇒ 拉取永远不会让本机看起来"有待上行内容"；
+/// - 云同步未配置时**只有**"这一篇不在本地"才会失败（本地已有的篇照常可读）——
+///   这就是为什么 `store` 是 `Option`：设置页没配云的时候不该连"打开已下载的笔记"都拒绝。
+#[tauri::command]
+pub async fn note_fetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    guid: String,
+) -> Result<crate::sync::FetchReport, String> {
+    if state.view_context() != ViewContext::Library {
+        return Err(
+            "WRONG_CONTEXT: 按需拉取只能用于「我的笔记库」（为知笔记视图是只读的本地数据）".into(),
+        );
+    }
+    let root = state
+        .library_dir()
+        .ok_or("NO_CONTEXT: 尚未设置笔记库目录")?;
+    let cfg = state.settings.lock().unwrap().sync.clone();
+    // 只有真要去云端时才构造存储：未配置/未初始化一律 `None`，由 `fetch_note` 在
+    // "本地没有这一篇"那一步才报 SYNC_DISABLED（已在本地的篇不该被云配置拖累）。
+    let store: Option<Arc<dyn crate::store::ObjectStore>> =
+        if cfg.enabled && cfg.initialized && !cfg.credential_user.is_empty() {
+            Some(store_from_state(&cfg)?)
+        } else {
+            None
+        };
+    // 与 `run_sync` / 写路径共用一把锁：拉取会落盘，不能和同步/写入并行
+    let guard = crate::sync::try_acquire(&root)?;
+    let Some(_guard) = guard else {
+        return Err("SYNC_BUSY: 正在同步/写入，稍后再打开这一篇".into());
+    };
+    let index_db = crate::config::index_file_for_library(&root);
+    let rep = crate::sync::fetch_note(
+        store.as_deref(),
+        &cfg,
+        &root,
+        &index_db,
+        &guid,
+    )
+    .await?;
+    // 包刚落盘 ⇒ 解析器要重读清单、ZipService 的 LRU 要清（否则可能命中旧句柄/未命中）
+    state.invalidate_library_cache()?;
+    if rep.fetched {
+        let _ = app.emit(
+            "note-fetched",
+            serde_json::json!({
+                "guid": rep.guid,
+                "bytes": rep.bytes,
+                "attachments": rep.attachments,
+            }),
+        );
+    }
+    Ok(rep)
 }
 
 #[tauri::command]
@@ -909,6 +972,12 @@ pub struct NoteItem {
     pub body_text_length: i64,
     pub package_size: i64,
     pub is_empty: bool,
+    /// **按需下载**：该篇的 zip 是否已在本机。`false` = 清单有行、包在云端
+    /// （列表上打 ☁，选中时由 `note_fetch` 拉取）。全量模式下恒为 true。
+    ///
+    /// 判据是**磁盘实况**（清单落点 + `is_file()`），不是清单里的任何列 ——
+    /// 清单描述"应该有什么"，这里要回答"本机有没有"。两者在按需模式下本来就可以不同。
+    pub downloaded: bool,
 }
 
 #[tauri::command]
@@ -959,12 +1028,21 @@ pub fn list_notes(
                 body_text_length: r.get(8)?,
                 package_size: r.get(9)?,
                 is_empty: false,
+                downloaded: true, // 下面按磁盘实况覆写
             })
         })
         .map_err(|e| e.to_string())?;
     let mut items: Vec<NoteItem> = rows.flatten().collect();
+    // 按需下载：逐篇问磁盘"包在不在"。源模式下没有库解析器（`None`）⇒ 一律视为已下载。
+    let resolver = state.library_resolver.lock().unwrap().clone();
     for it in &mut items {
-        it.is_empty = it.body_text_length < 10; // P2 近空笔记
+        it.downloaded = match &resolver {
+            Some(r) => r.resolve(&it.guid).map(|p| p.is_file()).unwrap_or(false),
+            None => true,
+        };
+        // 未下载的篇 `body_text_length` 必然是 0（正文没进索引）—— 不能据此判"空笔记"，
+        // 否则整库都会挂上"空笔记"徽标。判空只在**已下载**的篇上做。
+        it.is_empty = it.downloaded && it.body_text_length < 10; // P2 近空笔记
     }
     Ok(items)
 }
@@ -997,6 +1075,8 @@ pub struct NoteDetail {
     /// 且**不会**把"读不到"显示成某一种形态（见 [`ZipService::body_format_tag`]）。
     pub body_format: Option<String>,
     pub attachments: Vec<AttachmentItem>,
+    /// **按需下载**：包是否已在本机（`Reader.vue` 据此决定"先拉再渲染"）。见 [`NoteItem::downloaded`]。
+    pub downloaded: bool,
 }
 
 #[tauri::command]
@@ -1021,11 +1101,18 @@ pub fn get_note_detail(state: State<AppState>, guid: String) -> Result<NoteDetai
                 body_text_length: r.get(7)?,
                 body_format: None, // 下面按包内实况填（要看 zip，不在索引里）
                 attachments: vec![],
+                downloaded: false,
             })
         })
         .map_err(|e| e.to_string())?;
     drop(st);
     detail.body_format = state.zip.body_format_tag(&guid);
+    // 磁盘实况（与 `list_notes` 同口径）：按需下载的篇在拉取前 `body_format` 必然是 None，
+    // 前端必须能区分"还没下载"与"包坏了"—— 前者可自愈（自动拉取），后者不能。
+    detail.downloaded = match state.library_resolver.lock().unwrap().clone() {
+        Some(r) => r.resolve(&guid).map(|p| p.is_file()).unwrap_or(false),
+        None => true,
+    };
 
     // 附件：直挂（tier1/2 + db-missing）+ Tier3 多归属
     let mut st = conn

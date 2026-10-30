@@ -684,6 +684,17 @@ pub fn load_notes(conn: &Connection) -> Result<HashMap<String, ManifestNote>, St
     Ok(rows.flatten().map(|n| (n.guid.clone(), n)).collect())
 }
 
+/// 取**单篇**清单行（按需下载的入口：拉取前先问清单"这篇应该是什么样"）。
+///
+/// 实现直接复用 [`load_notes`] 再取一个键：单篇拉取是"用户点一下"级别的事件（不是批量循环），
+/// 全表 1780 行的解析开销远小于一次网络往返；而**另写一条 SELECT 就等于第二份列清单**，
+/// 以后加列必然漏改一处（v5 的 `origin`/`content_format` 就踩过）。
+/// `guid` 允许带花括号（云端对象键形态），这里先归一。
+pub fn load_one_note(conn: &Connection, guid: &str) -> Result<Option<ManifestNote>, String> {
+    let g = guid.trim().trim_matches(['{', '}']);
+    Ok(load_notes(conn)?.remove(g))
+}
+
 /// 全表**行级 revision**（v3 列）→ `guid → revision`。U5 冲突检测用（与远端清单逐篇比对）。
 /// 列缺失（v2 老库）→ 返回空表（调用方按 0 处理），不报错。
 pub fn load_note_revisions(conn: &Connection) -> Result<HashMap<String, i64>, String> {
@@ -1147,6 +1158,19 @@ pub fn check_invariants_deep(conn: &Connection, dest_root: &Path) -> Result<Vec<
     check_invariants_impl(conn, dest_root, true)
 }
 
+/// 这条告警是不是「清单有行、磁盘无包」那一条（按需下载模式下的**常态**）。
+///
+/// 为什么要一个判据函数而不是让调用方各自 `starts_with`：这条告警在**按需下载**下
+/// 不代表任何问题（包在云端，打开即拉取），但 `check_invariants` 有三十多个调用点
+/// （写路径 / 导出 / 各个库操作），逐个加策略参数不现实。口径统一放在这里：
+/// 调用方知道自己是"用户可见的结论"（CLI `verify-library`、UI 自检）时，用本函数
+/// 把它从「问题」里摘出来，其余写路径照旧把它当信息透传（`App.vue` 侧也过滤同一前缀）。
+///
+/// ⚠️ **全量模式**下这条告警是真问题（清单与磁盘脱节）⇒ 调用方只在按需模式下才摘。
+pub fn is_absent_warning(w: &str) -> bool {
+    w.starts_with("清单行缺文件")
+}
+
 /// `deep=true` 时逐篇重算 MD5；`false` 时只比体积
 fn check_invariants_impl(
     conn: &Connection,
@@ -1157,6 +1181,13 @@ fn check_invariants_impl(
     let mut warns = Vec::new();
 
     // 1. 每行 exported_path 指向的文件必须存在、体积相符；deep 时另比 MD5
+    //
+    // **缺文件聚合为一行**（2026-10-25 按需下载）：按需模式下"清单有行、磁盘无包"是**常态**，
+    // 逐篇 push 会产出 1780 条告警 —— 写到 UI 上就是每次改名/移动都弹一个装不下的窗口
+    // （`App.vue` 把 `warnings` 逐条塞进 alert）。聚合后仍是同一事实，只是不再刷屏；
+    // 坏处是"具体哪几篇缺"要自己找，故保留前 3 个样本。
+    // ⚠️ 与 [`check_attachment_invariants`]（附件侧，逐条）不是同一件事，别顺手统一。
+    let mut absent: Vec<&str> = Vec::new();
     for n in rows.values() {
         let p = dest_root.join(&n.exported_path);
         match std::fs::metadata(&p) {
@@ -1177,8 +1208,16 @@ fn check_invariants_impl(
                     }
                 }
             }
-            _ => warns.push(format!("清单行缺文件: {}", n.exported_path)),
+            _ => absent.push(n.exported_path.as_str()),
         }
+    }
+    if !absent.is_empty() {
+        let sample: Vec<&str> = absent.iter().take(3).copied().collect();
+        warns.push(format!(
+            "清单行缺文件: {} 篇（磁盘上没有该 zip；按需下载模式下 = 尚未下载，打开即拉取）——{}",
+            absent.len(),
+            sample.join(", ")
+        ));
     }
     // 2. 导出目录内未被清单覆盖的孤儿 zip（报告，不静默删除）。
     //    顶层 `_` 前缀目录是**系统保留区**（_trash / _conflicts / _unlinked_attachments，§3.1）：

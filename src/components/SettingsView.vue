@@ -145,7 +145,7 @@ function emptySyncForm(): SyncCfg {
     enabled: false, role: 'writer', local_root: '', endpoint: '', bucket: '',
     prefix: '', region: 'us-east-1', path_style: true, access_key_id: '',
     credential_user: '', concurrency: 4, auto_check_on_start: true,
-    initialized: false,
+    initialized: false, download_policy: 'full',
   }
 }
 
@@ -201,7 +201,11 @@ async function saveConfig() {
     await api.saveSyncConfig({ ...form.value }, secretKey.value || null)
     secretKey.value = '' // 保存后立即清空，不再回显
     await loadSync()
-    syncMsg.value = '配置已保存'
+    syncMsg.value =
+      '配置已保存' +
+      (form.value.download_policy === 'on_demand'
+        ? '（笔记下载=按需：从下次同步起只拉清单，本地已有的笔记不会被删除）'
+        : '')
   } catch (e) {
     syncMsg.value = String(e)
   } finally {
@@ -274,6 +278,7 @@ function syncReportSummary(r: SyncReport): string {
   else if (r.direction === 'down') parts.push(`下载 ${r.downloaded} / 移入回收站 ${r.trashed}`)
   else parts.push('无变更')
   if (r.conflicts) parts.push(`冲突留存 ${r.conflicts}`) // U5 → _conflicts/
+  if (r.pending) parts.push(`按需跳过 ${r.pending} 篇（未下载，打开即拉取）`)
   if (r.retried) parts.push(`对齐重试 ${r.retried} 次`) // LWW D1
   if (r.overwritten_remote) parts.push(`覆盖远端版 ${r.overwritten_remote}（副本在 _conflicts/）`) // LWW D4
   if (r.oversized) parts.push(`超限 ${r.oversized}`)
@@ -564,6 +569,26 @@ async function update(patch: Partial<Settings>) {
           <input v-model="form.role" type="radio" value="reader" /> 只读端（以云端为准，只下行，不接受本地写入）
         </label>
       </div>
+      <!-- 下行策略（按需下载）：与"角色"是两件事 —— 角色管能不能写，策略管拉不拉包 -->
+      <div class="settings-row">
+        <label>笔记下载</label>
+        <label class="inline-check">
+          <input v-model="form.download_policy" type="radio" value="full" /> 全量
+        </label>
+        <label class="inline-check">
+          <input v-model="form.download_policy" type="radio" value="on_demand" /> 按需（只在云端）
+        </label>
+      </div>
+      <div class="settings-row">
+        <label></label>
+        <span style="color: var(--text-2); font-size: 12px">
+          {{
+            form.download_policy === 'on_demand'
+              ? '只同步清单（数据库）：同步不再下载任何笔记，本地只有目录与标题；选中某篇时才把它（含附件）拉到本机。省空间，但未下载的篇搜不到正文、也不能离线阅读'
+              : '全量：同步时把清单与全部笔记包都拉到本机（离线可用；首次约需下载整库体积）'
+          }}
+        </span>
+      </div>
       <div class="settings-row">
         <label>Endpoint</label>
         <input class="text-input" v-model="form.endpoint" placeholder="http://minio.example.local:9000" />
@@ -608,8 +633,20 @@ async function update(patch: Partial<Settings>) {
           :disabled="syncBusy !== ''"
           @click="initSync"
         >
-          {{ syncBusy.startsWith('init') ? '初始化中…' : syncCfg.config.initialized ? '重新初始化' : '初始化' }}
+          {{
+            syncBusy.startsWith('init')
+              ? '初始化中…'
+              : (syncCfg.config.initialized ? '重新初始化' : '初始化') +
+                (syncCfg.config.download_policy === 'on_demand' ? '（只拉清单）' : '')
+          }}
         </button>
+        <!-- 初始化/同步都用**已保存**的配置（后端读 settings，不读表单）⇒ 必须点破这件事 -->
+        <span
+          v-if="form.download_policy !== syncCfg.config.download_policy"
+          style="color: var(--danger); font-size: 12px"
+        >
+          笔记下载方式已改动 —— 请先「保存配置」再初始化/同步
+        </span>
         <button :disabled="syncBusy !== ''" @click="clearCreds">清除凭据</button>
       </div>
       <div class="progress-text">{{ syncMsg }}</div>
@@ -623,6 +660,7 @@ async function update(patch: Partial<Settings>) {
     <div v-if="syncStatus && syncStatus.enabled && syncStatus.initialized" class="report-box">
       <div>
         角色：{{ syncStatus.role === 'reader' ? '只读端' : '写入端' }}
+        ・笔记：{{ syncCfg?.config.download_policy === 'on_demand' ? '按需（只在云端）' : '全量' }}
         ・revision：{{ syncStatus.local_revision }}
         ・上次同步：{{ syncStatus.last_sync_at ?? '从未' }}
       </div>

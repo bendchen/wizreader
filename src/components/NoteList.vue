@@ -148,6 +148,8 @@ function onDragStart(e: DragEvent, item: NoteItem) {
           <span v-if="n.has_attachment" title="含附件">📎</span>
           <span v-if="n.is_webclip" title="网页剪藏">🔗</span>
           <span v-if="n.is_empty" class="badge warn">空笔记</span>
+          <!-- 按需下载：这篇只在云端（清单有行、包未落盘）。点开时自动拉取 -->
+          <span v-if="!n.downloaded" class="badge cloud" title="只在云端：选中后自动下载到本机">☁ 云端</span>
           <span>{{ formatSize(n.package_size) }}</span>
         </div>
       </div>

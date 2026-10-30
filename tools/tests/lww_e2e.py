@@ -15,6 +15,7 @@
 | `S5 If-Match 方言` | Ceph 去引号适配 | 引号形式 412 → 去引号重试成功；调用方**看不到** 412（`retried==0`） |
 | `S6 附件下行云端胜` | D5 | md5 分歧 ⇒ 覆盖本地且**真的发了 GET**；md5 相同 ⇒ **一个 GET 都不发** |
 | `S7 真云双 writer` | 真云复跑（§6 第 1 项） | 独立前缀下 A 上行 → B 上行（对齐）→ A 再上行（再对齐）；`put_bytes_if` / `put_file_if` 在真 Ceph 上都走通；双端 `--deep` 全绿；跑完清空前缀 |
+| `S8 按需下载` | cloud-only 库（`download_policy=on_demand`） | 下行 `downloaded==0` / `pending==N` / 磁盘 0 个 zip / 清单与索引篇数齐全 / 正文没进索引；`note-fetch` 只落**那一篇**（含附件）、正文进索引、**清单字节逐字节未变**、再点零网络；下一轮下行仍 0 下载且已下载篇不被改动 |
 
 夹具（`/tmp` 内，源只读）
 ------------------------
@@ -65,7 +66,17 @@ REAL: dict = {}  # `--real-cloud` 时填充（endpoint/bucket/prefix/ak/sk）；
 RE_UP = re.compile(
     r"上传 (\d+) / 跳过 (\d+) / 超限 (\d+) / 冲突留存 (\d+) / 对齐重试 (\d+) / 覆盖远端版 (\d+)"
 )
-RE_DOWN = re.compile(r"下载 (\d+) / 移入回收站 (\d+) / 失败 (\d+)")
+RE_DOWN = re.compile(r"下载 (\d+) / 移入回收站 (\d+) / 失败 (\d+) / 按需跳过 (\d+)")
+# 按需下载（`note-fetch`）的两个终态输出（`cli/src/main.rs::cmd_note_fetch`）
+RE_FETCHED = re.compile(r"已拉取 \S+：(\d+) B，随篇附件 (\d+) 个，索引(\S+)")
+
+
+def parse_fetch(stdout: str) -> dict:
+    m = RE_FETCHED.search(stdout)
+    if m:
+        return {"fetched": True, "bytes": int(m.group(1)),
+                "attachments": int(m.group(2)), "indexed": m.group(3) == "已补齐"}
+    return {"fetched": False, "already_local": "已在本机" in stdout}
 
 
 # ---------------------------------------------------------------- 基础设施
@@ -133,7 +144,7 @@ class Machine:
 
     def __init__(
         self, bench: Bench, work: str, name: str, port: int = 0, role: str = "writer",
-        cloud: dict | None = None,
+        cloud: dict | None = None, policy: str = "full",
     ):
         self.bench = bench
         self.name = name
@@ -142,6 +153,7 @@ class Machine:
         os.makedirs(self.home, exist_ok=True)
         self.port = port
         self.cloud = cloud
+        self.policy = policy          # 下行策略：full（默认）| on_demand（按需下载）
         self.role = role
         self.write_settings(role)
 
@@ -175,6 +187,9 @@ class Machine:
                 "concurrency": 4,
                 "auto_check_on_start": False,
                 "initialized": True,
+                # 显式写全：缺字段时 Rust 侧 `#[serde(default)]` 会回落到 full，
+                # 但脚本里显式声明才能表达"本机就是要按需"，也让 S8 的意图写在数据里
+                "download_policy": self.policy,
             },
         }
         with open(os.path.join(self.home, "settings.json"), "w", encoding="utf-8") as f:
@@ -211,6 +226,10 @@ class Machine:
 
     def down(self, expect_rc: int = 0):
         return self.run("cloud-sync", "down", expect_rc=expect_rc)
+
+    def note_fetch(self, guid: str, expect_rc: int = 0):
+        """按需下载的单篇补下（= UI 里"选中一篇"走的那条路）。"""
+        return self.run("note-fetch", guid, expect_rc=expect_rc)
 
     def save_note(self, guid: str, text: str, tag: str, expect_rc: int = 0):
         f = os.path.join(self.home, f"new-{tag}.md")
@@ -272,6 +291,40 @@ class Machine:
 
     def conflict_path(self, guid: str, rev: int) -> str:
         return os.path.join(self.lib, "_conflicts", f"{guid}_{rev}.zip")
+
+    # ---- 派生索引（`~/.wizreader/index-{hash8}.db`，被 WIZREADER_HOME 重定向到本机 home）----
+    def index_path(self) -> str:
+        """本例的派生索引文件。
+
+        文件名含库根 hash8，脚本**不去复算**那个哈希 —— 一台机器一个库，故 home 下
+        有且只有一个 `index-*.db`，直接取它（复算哈希会和 Rust 侧实现绑死，改算法就假红）。
+        """
+        cands = sorted(
+            os.path.join(self.home, f)
+            for f in os.listdir(self.home)
+            if f.startswith("index-") and f.endswith(".db")
+        )
+        return cands[0] if cands else os.path.join(self.home, "(索引尚未生成).db")
+
+    def index_query(self, sql: str, args: tuple = ()) -> list:
+        p = self.index_path()
+        if not os.path.exists(p):
+            return []
+        c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            return c.execute(sql, args).fetchall()
+        finally:
+            c.close()
+
+    def index_rows(self) -> int:
+        """索引里的 note 行数（≠ 磁盘包数：按需模式下**行齐全、正文不全**）。"""
+        r = self.index_query("select count(*) from note")
+        return int(r[0][0]) if r else -1
+
+    def index_body_len(self, guid: str) -> int:
+        """该篇正文进了索引多少字符（0 = 尚未下载 / 空正文）。"""
+        r = self.index_query("select body_text_length from note where guid=?", (guid,))
+        return int(r[0][0]) if r else -1
 
 
 class RealCloud:
@@ -423,8 +476,14 @@ def parse_up(stdout: str) -> dict:
 def parse_down(stdout: str) -> dict:
     m = RE_DOWN.search(stdout)
     if not m:
-        return {"downloaded": 0, "trashed": 0, "failures": 0, "none": "无变更" in stdout}
-    return {"downloaded": int(m.group(1)), "trashed": int(m.group(2)), "failures": int(m.group(3))}
+        return {"downloaded": 0, "trashed": 0, "failures": 0, "pending": 0,
+                "none": "无变更" in stdout}
+    return {
+        "downloaded": int(m.group(1)),
+        "trashed": int(m.group(2)),
+        "failures": int(m.group(3)),
+        "pending": int(m.group(4)),   # 按需下载模式下"清单有行、本轮没下"的篇数
+    }
 
 
 def cloud_md5(stub, key: str):
@@ -498,6 +557,21 @@ def fresh(work: str, name: str):
     os.makedirs(d)
     httpd, port, stub = s3stub.serve_in_thread(0)
     return d, httpd, port, stub
+
+
+def zip_count(lib: str) -> int:
+    """库内**笔记包**数。
+
+    跳过顶层 `_` 保留区（`_trash` / `_conflicts` / `_attachments` / `_unlinked_attachments`）：
+    那里面的 zip 按设计与清单无关（回收站里的、旁置的冲突版），算进来会让
+    "磁盘上一个包都没有"永远不成立。
+    """
+    n = 0
+    for base, dirs, files in os.walk(lib):
+        if os.path.relpath(base, lib) == ".":
+            dirs[:] = [d for d in dirs if not d.startswith("_")]
+        n += sum(1 for f in files if f.endswith(".zip"))
+    return n
 
 
 def dump_events(stub) -> None:
@@ -980,6 +1054,139 @@ def s7_real_cloud(bench: Bench, work: str, base: str) -> None:
             print(f"  ⚠️ 清理不干净：前缀 {cloud['prefix']} 下仍剩 {left} 个对象，需手工删")
 
 
+def s8_on_demand(bench: Bench, work: str, base: str) -> None:
+    """按需下载（cloud-only 库）：**下行只同步清单**，选中一篇才拉那一篇（含附件）。
+
+    这是"本地没有笔记，都在云端"的实现形态：
+    - 下行 = 只把 export.db（清单/数据库）对齐，**一个笔记包、一个附件都不下**；
+    - 用户点开某篇 = `note-fetch`（UI 里 `Reader.vue` 渲染前调 `note_fetch`）拉**那一篇**，
+      并把它补进派生索引（否则"能看不能搜"）。
+
+    关键断言是**清单字节逐字节不变**：拉取不是同步 —— 不置脏、不铸版、不推水位。
+    若哪天有人在 `fetch_note` 里顺手写了清单，这里会立刻红（那是把"读"变成了"写"）。
+    """
+    bench.section("S8 按需下载（只同步清单 ⇒ 选中即拉取单篇 + 附件）")
+    w, httpd, port, stub = fresh(work, "s8")
+    try:
+        # ---- 云端来源：A 全量上行（含一篇的附件） ----
+        A = Machine(bench, w, "A", port, "writer")
+        A.clone_from(base)
+        n = A.note_count()
+        # 取**最大的**两篇：`pick_notes` 默认按体积升序，最小那几篇里有「空页」
+        # （真实库里有 36/37 字节的空摘要页），拿它们验"正文进索引"会永远 0 字符。
+        with A.db() as c:
+            guid, other = [
+                r[0]
+                for r in c.execute(
+                    "select guid from note where origin='wiznote' "
+                    "order by exported_size desc limit 2"
+                )
+            ]
+        att_name = "ondemand.txt"
+        att_v1 = b"attachment-for-on-demand\n"
+        inject_attachment(A, guid, att_name, att_v1)
+        rep = parse_up(A.cloud_init("writer").stdout)
+        bench.eq(f"A 全量初始化上传 {n} 篇 + 1 个附件", rep.get("uploaded"), n + 1)
+        att_cloud_key = f"native/attachments/{att_name}"
+        bench.check(
+            "云端有该附件对象",
+            cloud_md5(stub, att_cloud_key) == md5_bytes(att_v1),
+            att_cloud_key,
+        )
+        cloud_zip = cloud_md5(stub, note_key(guid))
+
+        # ---- B：按需模式首次下行 = 只拉清单 ----
+        B = Machine(bench, w, "B", port, "reader", policy="on_demand")
+        p = B.cloud_init("reader")
+        d = parse_down(p.stdout)
+        bench.eq("B 首次下行：**一个笔记包都不下**", d.get("downloaded"), 0)
+        bench.eq(f"B 记下待按需拉取的篇数（{n} 篇全在云端）", d.get("pending"), n)
+        bench.eq("B 清单 revision 对齐云端", B.rev(), 1)
+        bench.eq("B 清单篇数 == 云端", B.note_count(), n)
+        bench.eq("B 磁盘上一个笔记包都没有", zip_count(B.lib), 0)
+        bench.eq(
+            "B 也没下附件实体（按需模式下附件同样懒加载）",
+            os.path.exists(os.path.join(B.lib, "_attachments", att_name)),
+            False,
+        )
+        bench.eq("B 派生索引仍列出全部篇（列表/目录树可用）", B.index_rows(), n)
+        bench.eq("未下载篇的正文没有进索引", B.index_body_len(guid), 0)
+        bench.eq("按需模式下库自检不把「未下载」判成问题", B.verify_deep().returncode, 0)
+        bench.check(
+            "下行日志写明只同步了清单",
+            "按需下载：本轮只同步清单" in B.log_since(0),
+            B.log_since(0).strip()[-160:],
+        )
+
+        # ---- 选中一篇 = 只把那一篇拉下来 ----
+        manifest_before = B.manifest_bytes()
+        rev_before = B.rev()
+        gets_before = get_count(stub, note_key(guid))
+        att_gets_before = get_count(stub, att_cloud_key)
+        p = B.note_fetch(guid)
+        f = parse_fetch(p.stdout)
+        bench.eq("选中该篇 ⇒ 拉取成功", p.returncode, 0)
+        bench.check("输出报告「已拉取」（不是「已在本机」）", f.get("fetched") is True, p.stdout.strip()[:160])
+        bench.check("只落了这一篇（其余 {} 篇仍在云端）".format(n - 1), zip_count(B.lib) == 1, str(zip_count(B.lib)))
+        bench.check("落点 == 清单的 exported_path", os.path.isfile(B.note_path(guid)))
+        bench.check("字节 == 云端对象", B.note_md5(guid) == cloud_zip)
+        bench.eq("本篇对象只发了 1 次 GET", get_count(stub, note_key(guid)) - gets_before, 1)
+        bench.eq("随篇附件也拉下来了", get_count(stub, att_cloud_key) - att_gets_before, 1)
+        bench.eq("报告里的附件计数", f.get("attachments"), 1)
+        bench.check(
+            "附件实体落库内保留区 `_attachments/` 且字节正确",
+            os.path.exists(os.path.join(B.lib, "_attachments", att_name))
+            and md5_file(os.path.join(B.lib, "_attachments", att_name)) == md5_bytes(att_v1),
+        )
+        bench.check("报告写明索引已补齐", f.get("indexed") is True, p.stdout.strip()[:160])
+        bench.check("正文已进派生索引（能看也能搜）", B.index_body_len(guid) > 0, str(B.index_body_len(guid)))
+        bench.eq("索引行数不变（补的是正文，不是行）", B.index_rows(), n)
+        bench.check(
+            "**清单字节一字未改**（拉取不是同步：不置脏、不铸版、不推水位）",
+            B.manifest_bytes() == manifest_before,
+        )
+        bench.eq("清单 revision 未动", B.rev(), rev_before)
+        bench.eq("该篇闩仍是干净的", B.latch(guid), (0, 0))
+
+        # ---- 幂等：再点一次零网络 ----
+        gets2 = get_count(stub, note_key(guid))
+        att_gets2 = get_count(stub, att_cloud_key)
+        p2 = B.note_fetch(guid)
+        bench.eq("再点一次仍返回成功", p2.returncode, 0)
+        bench.check("再点一次：输出「已在本机」", "已在本机" in p2.stdout, p2.stdout.strip()[:160])
+        bench.eq("再点一次：0 次对象 GET", get_count(stub, note_key(guid)) - gets2, 0)
+        bench.eq("再点一次：附件也不再 GET", get_count(stub, att_cloud_key) - att_gets2, 0)
+
+        # ---- 远端又变了：下行仍只对齐清单，已下载的篇不受影响 ----
+        A.save_note(other, edit_text("A-on-demand-2"), "A2")
+        rep = parse_up(A.up().stdout)
+        bench.eq("A 上行 1 篇", rep.get("uploaded"), 1)
+        bench.eq("云端 rev 前进到 2", stub.revision(), 2)
+        local_zip_md5 = B.note_md5(guid)
+        p = B.down()
+        d = parse_down(p.stdout)
+        bench.eq("B 第二次下行：仍然一个包都不下", d.get("downloaded"), 0)
+        # 68 = 69 - 1：**已下载那一篇不再计入待拉取**（`same && dest.is_file()` 命中），
+        # 而 A 刚改的那一篇 md5 变了、照样算待拉取
+        bench.eq(f"待按需拉取 {n - 1} 篇（已下载的不再计入）", d.get("pending"), n - 1)
+        bench.eq("B 清单前进到 rev2", B.rev(), 2)
+        bench.eq("磁盘上仍然只有那一个包", zip_count(B.lib), 1)
+        bench.check("已下载的那一篇字节没被改动", B.note_md5(guid) == local_zip_md5)
+        bench.eq("按需模式下库自检仍然通过", B.verify_deep().returncode, 0)
+
+        # ---- 清单里没有的 guid：明确错误，不动磁盘 ----
+        p3 = B.note_fetch("00000000-0000-0000-0000-000000000000", expect_rc=1)
+        bench.check(
+            "不存在的篇 ⇒ NOTE_NOT_FOUND（不静默成功）",
+            "NOTE_NOT_FOUND" in (p3.stdout + p3.stderr),
+            (p3.stderr or p3.stdout).strip()[:160],
+        )
+        bench.eq("错误请求后磁盘仍只有一个包", zip_count(B.lib), 1)
+    finally:
+        dump_events(stub)
+        httpd.shutdown()
+
+
 SCENARIOS = {
     "S1": s1_two_writers,
     "S2": s2_manifest_412,
@@ -988,6 +1195,7 @@ SCENARIOS = {
     "S5": s5_if_match_dialect,
     "S6": s6_attachment_down,
     "S7": s7_real_cloud,
+    "S8": s8_on_demand,
 }
 
 
